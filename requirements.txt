@@ -1,0 +1,29 @@
+# Requirements for PDA3 (DA3 finetuning on Waymo)
+
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0
+opencv-python>=4.5.0
+Pillow>=8.0.0
+
+# Transformers and utilities
+einops>=0.6.0
+omegaconf>=2.3.0
+
+# Visualization and logging
+tensorboard>=2.10.0
+matplotlib>=3.5.0
+tqdm>=4.60.0
+
+# Config and yaml
+pyyaml>=6.0
+
+# Optional: distributed training
+# torch-distributed
+
+# Optional: wandb logging
+# wandb>=0.12.0
+
+# Optional: xformers for efficient attention
+# xformers>=0.0.20
