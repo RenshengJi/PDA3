@@ -25,6 +25,157 @@ from src.model.utils.transform import extri_intri_to_pose_encoding
 from src.model.utils.ray_utils import get_extrinsic_from_camray
 
 
+def _solve_least_squares_affine(pred_flat, gt_flat, with_shift=True, eps=1e-8):
+    """
+    Solve least squares for affine alignment: gt = scale * pred + shift
+
+    Args:
+        pred_flat: Flattened predicted depth values
+        gt_flat: Flattened GT depth values
+        with_shift: Whether to compute shift or just scale
+        eps: Small epsilon for numerical stability
+
+    Returns:
+        scale, shift: Alignment parameters
+    """
+    device = pred_flat.device
+
+    if with_shift:
+        n = pred_flat.numel()
+        sum_pred = pred_flat.sum()
+        sum_gt = gt_flat.sum()
+        sum_pred_sq = (pred_flat * pred_flat).sum()
+        sum_pred_gt = (pred_flat * gt_flat).sum()
+
+        det = sum_pred_sq * n - sum_pred * sum_pred
+        if det.abs() < eps:
+            scale = sum_pred_gt / sum_pred_sq.clamp_min(eps)
+            shift = torch.tensor(0.0, device=device)
+        else:
+            scale = (sum_pred_gt * n - sum_pred * sum_gt) / det
+            shift = (sum_pred_sq * sum_gt - sum_pred * sum_pred_gt) / det
+    else:
+        scale = (gt_flat * pred_flat).sum() / (pred_flat * pred_flat).sum().clamp_min(eps)
+        shift = torch.tensor(0.0, device=device)
+
+    return scale, shift
+
+
+def align_depth_least_squares(
+    pred_depth, gt_depth, valid_mask=None, with_shift=True,
+    use_ransac=True, ransac_iters=100, ransac_sample_ratio=0.5,
+    inlier_thresh=None, eps=1e-8
+):
+    """
+    Align predicted depth to GT depth using least squares with RANSAC.
+
+    Based on DA3 paper Section 4.2: Teaching Depth Anything 3
+    For affine-invariant depth, we solve: gt = scale * pred + shift
+
+    RANSAC is used to robustly estimate scale/shift by:
+    1. Randomly sample a subset of points
+    2. Fit scale/shift on the subset
+    3. Count inliers based on residual threshold
+    4. Keep the best model with most inliers
+    5. Refit on all inliers
+
+    Args:
+        pred_depth: [B, S, H, W] or [B, S, H, W, 1] - Predicted/teacher depth
+        gt_depth: [B, S, H, W] or [B, S, H, W, 1] - Ground truth depth
+        valid_mask: [B, S, H, W] - Valid depth mask (optional)
+        with_shift: Whether to compute shift (affine) or just scale
+        use_ransac: Whether to use RANSAC for robust estimation
+        ransac_iters: Number of RANSAC iterations
+        ransac_sample_ratio: Ratio of points to sample in each iteration
+        inlier_thresh: Inlier threshold (auto-computed if None)
+        eps: Small epsilon for numerical stability
+
+    Returns:
+        aligned_depth: [B, S, H, W] - Aligned depth matching GT scale/shift
+        scale: Scale factor used
+        shift: Shift factor used (0 if with_shift=False)
+    """
+    # Handle dimension
+    if pred_depth.dim() == 5:
+        pred_depth = pred_depth.squeeze(-1)
+    if gt_depth.dim() == 5:
+        gt_depth = gt_depth.squeeze(-1)
+
+    # Create valid mask if not provided
+    if valid_mask is None:
+        valid_mask = (gt_depth > eps) & (pred_depth > eps)
+    else:
+        valid_mask = valid_mask & (gt_depth > eps) & (pred_depth > eps)
+
+    # Flatten for computation
+    pred_flat = pred_depth[valid_mask]
+    gt_flat = gt_depth[valid_mask]
+
+    device = pred_depth.device
+    n_valid = pred_flat.numel()
+
+    if n_valid < 10:
+        # Not enough valid points, return unaligned
+        return pred_depth.clone(), torch.tensor(1.0, device=device), torch.tensor(0.0, device=device)
+
+    if not use_ransac or n_valid < 100:
+        # Direct least squares without RANSAC
+        scale, shift = _solve_least_squares_affine(pred_flat, gt_flat, with_shift, eps)
+    else:
+        # RANSAC-based robust estimation
+        n_samples = max(10, int(n_valid * ransac_sample_ratio))
+
+        # Auto-compute inlier threshold based on initial fit residuals
+        if inlier_thresh is None:
+            init_scale, init_shift = _solve_least_squares_affine(pred_flat, gt_flat, with_shift, eps)
+            residuals = torch.abs(gt_flat - (init_scale * pred_flat + init_shift))
+            inlier_thresh = torch.median(residuals) * 1.5  # 1.5x median residual
+
+        best_scale = torch.tensor(1.0, device=device)
+        best_shift = torch.tensor(0.0, device=device)
+        best_inlier_count = 0
+        best_inlier_mask = None
+
+        for _ in range(ransac_iters):
+            # Random sample
+            idx = torch.randperm(n_valid, device=device)[:n_samples]
+            sample_pred = pred_flat[idx]
+            sample_gt = gt_flat[idx]
+
+            # Fit on sample
+            scale_cand, shift_cand = _solve_least_squares_affine(sample_pred, sample_gt, with_shift, eps)
+
+            # Count inliers
+            residuals = torch.abs(gt_flat - (scale_cand * pred_flat + shift_cand))
+            inlier_mask = residuals < inlier_thresh
+            inlier_count = inlier_mask.sum().item()
+
+            if inlier_count > best_inlier_count:
+                best_inlier_count = inlier_count
+                best_scale = scale_cand
+                best_shift = shift_cand
+                best_inlier_mask = inlier_mask
+
+        # Refit on all inliers
+        if best_inlier_mask is not None and best_inlier_count > 10:
+            inlier_pred = pred_flat[best_inlier_mask]
+            inlier_gt = gt_flat[best_inlier_mask]
+            scale, shift = _solve_least_squares_affine(inlier_pred, inlier_gt, with_shift, eps)
+        else:
+            scale, shift = best_scale, best_shift
+
+    # Clamp scale to reasonable range
+    scale = scale.clamp(min=0.01, max=100.0)
+
+    # Apply alignment
+    aligned_depth = scale * pred_depth + shift
+
+    # Ensure non-negative depth
+    aligned_depth = aligned_depth.clamp(min=0.0)
+
+    return aligned_depth, scale, shift
+
+
 def check_and_fix_inf_nan(loss_tensor, loss_name, hard_max=100):
     """
     Check and fix inf/nan values in loss tensor.
@@ -856,6 +1007,9 @@ class DA3Loss(nn.Module):
         # Teacher settings
         use_teacher=False,
         switch_to_teacher_step=120000,
+        teacher_align_with_shift=True,  # Whether to use affine (scale+shift) or scale-only alignment
+        teacher_use_ransac=True,  # Whether to use RANSAC for robust alignment
+        teacher_ransac_iters=100,  # Number of RANSAC iterations
     ):
         super().__init__()
 
@@ -890,6 +1044,9 @@ class DA3Loss(nn.Module):
 
         self.use_teacher = use_teacher
         self.switch_to_teacher_step = switch_to_teacher_step
+        self.teacher_align_with_shift = teacher_align_with_shift
+        self.teacher_use_ransac = teacher_use_ransac
+        self.teacher_ransac_iters = teacher_ransac_iters
 
     def forward(
         self,
@@ -920,9 +1077,39 @@ class DA3Loss(nn.Module):
 
         # Get GT depth - use teacher labels if enabled and past switch step
         if self.use_teacher and teacher_depth is not None and current_step >= self.switch_to_teacher_step:
-            # Replace GT depth with teacher pseudo-labels
-            gt_depth = teacher_depth.clone()
-            batch = {**batch, 'depths': gt_depth}
+            # Align teacher depth to GT depth scale/shift before replacing
+            # Teacher model outputs relative depth, need to align to GT metric depth
+            original_gt_depth = batch['depths'].clone()
+            valid_mask = batch.get('point_masks', None)
+
+            # Use least_squares with RANSAC for robust alignment
+            aligned_teacher_depth, scale, shift = align_depth_least_squares(
+                teacher_depth, original_gt_depth, valid_mask,
+                with_shift=self.teacher_align_with_shift,
+                use_ransac=self.teacher_use_ransac,
+                ransac_iters=self.teacher_ransac_iters
+            )
+            loss_dict['teacher_align_scale'] = scale
+            loss_dict['teacher_align_shift'] = shift
+
+            # Replace GT depth with aligned teacher pseudo-labels
+            # Teacher outputs dense depth, so create a dense mask (all True where depth > 0)
+            dense_mask = (aligned_teacher_depth > 0)
+
+            # Recompute dense world_points from aligned teacher depth and GT camera params
+            # This ensures the dense mask corresponds to dense point supervision
+            dense_world_points = depth_to_world_points(
+                aligned_teacher_depth,
+                batch['extrinsics'],
+                batch['intrinsics']
+            )
+
+            batch = {
+                **batch,
+                'depths': aligned_teacher_depth,
+                'point_masks': dense_mask,
+                'world_points': dense_world_points
+            }
 
         # Get predicted depth
         pred_depth = outputs['depth']

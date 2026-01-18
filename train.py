@@ -156,6 +156,7 @@ class Trainer:
 
         Per user request: Use DA3 model as teacher (since DA3-Teacher is not open-sourced).
         The teacher model is frozen and used to generate pseudo-labels.
+        Teacher model architecture is defined in config['teacher'].
         """
         teacher_config = self.config.get('teacher', {})
         use_teacher = teacher_config.get('enabled', False)
@@ -166,17 +167,18 @@ class Trainer:
                 print("Teacher model disabled")
             return
 
+        # Use teacher-specific config, fall back to model config if not specified
         model_config = self.config.get('model', {})
 
-        # Create teacher model with same architecture
+        # Create teacher model with teacher-specific architecture
         self.teacher_model = DepthAnything3Net(
-            encoder_name=model_config.get('encoder_name', 'vitl'),
-            out_layers=model_config.get('out_layers', [11, 15, 19, 23]),
-            features=model_config.get('features', 256),
-            out_channels=model_config.get('out_channels', [256, 512, 1024, 1024]),
-            alt_start=model_config.get('alt_start', 8),
-            qknorm_start=model_config.get('qknorm_start', 8),
-            rope_start=model_config.get('rope_start', 8),
+            encoder_name=teacher_config.get('encoder_name', model_config.get('encoder_name', 'vitl')),
+            out_layers=teacher_config.get('out_layers', model_config.get('out_layers', [11, 15, 19, 23])),
+            features=teacher_config.get('features', model_config.get('features', 256)),
+            out_channels=teacher_config.get('out_channels', model_config.get('out_channels', [256, 512, 1024, 1024])),
+            alt_start=teacher_config.get('alt_start', model_config.get('alt_start', 8)),
+            qknorm_start=teacher_config.get('qknorm_start', model_config.get('qknorm_start', 8)),
+            rope_start=teacher_config.get('rope_start', model_config.get('rope_start', 8)),
             predict_camera=False,  # Teacher doesn't need camera prediction
             use_camera_enc=False,  # Teacher doesn't use camera encoding
         )

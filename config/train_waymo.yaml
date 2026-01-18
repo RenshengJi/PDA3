@@ -25,9 +25,18 @@ model:
 
 # Teacher model configuration (for knowledge distillation)
 # Per user request: Use DA3 as teacher (since DA3-Teacher is not open-sourced)
-teacher: 
-  enabled: true  # Set to true to enable teacher-student distillation   FIXME: repeat
-  # Teacher checkpoint (defaults to model.pretrained if not specified)
+# Teacher model can have different architecture than student
+teacher:
+  enabled: true  # Set to true to enable teacher-student distillation
+  # Teacher model architecture (can differ from student model)
+  encoder_name: "vitg"  # Options: vits, vitb, vitl, vitg
+  out_layers: [19, 27, 33, 39]  # vitg layers (vitl uses [11, 15, 19, 23])
+  features: 256
+  out_channels: [256, 512, 1024, 1024]
+  alt_start: 13      # vitg parameter (vitl uses 8)
+  qknorm_start: 13   # vitg parameter (vitl uses 8)
+  rope_start: 13     # vitg parameter (vitl uses 8)
+  # Teacher checkpoint path
   checkpoint: "checkpoints/model.safetensors"
 
 # Data configuration
