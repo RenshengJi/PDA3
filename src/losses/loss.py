@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from math import ceil, floor
 
 from src.model.utils.transform import extri_intri_to_pose_encoding
+from src.model.utils.ray_utils import get_extrinsic_from_camray
 
 
 def check_and_fix_inf_nan(loss_tensor, loss_name, hard_max=100):
@@ -552,18 +553,19 @@ def point_loss(pts3d, pts3d_conf, batch, normalize_pred=True, gamma=1.0, alpha=0
     return conf_loss_dict
 
 
-def ray_loss(pred_ray, gt_ray, valid_mask, gamma=1.0):
+def ray_loss(pred_ray, gt_ray, gamma=1.0):
     """
     Ray map prediction loss (L_M in paper).
 
-    Each pixel ray r = (t, d) ∈ R^6, where:
-    - t: ray origin (camera center)
-    - d: ray direction (unnormalized to preserve projection scale)
+    Each pixel ray r = (d, t) ∈ R^6, where:
+    - d: ray direction (first 3 channels, unnormalized to preserve projection scale)
+    - t: ray origin/camera center (last 3 channels)
+
+    Note: No mask is needed for ray loss as it applies to all pixels.
 
     Args:
         pred_ray: [B, S, H, W, 6] predicted ray map
         gt_ray: [B, S, H, W, 6] ground truth ray map
-        valid_mask: [B, S, H, W] valid mask
         gamma: Loss weight
 
     Returns:
@@ -584,18 +586,11 @@ def ray_loss(pred_ray, gt_ray, valid_mask, gamma=1.0):
         )
         pred_ray = pred_ray_flat.reshape(B, S, 6, gt_ray.shape[2], gt_ray.shape[3]).permute(0, 1, 3, 4, 2)
 
-    # L1 loss on ray components
+    # L1 loss on ray components (no mask needed)
     loss = torch.abs(pred_ray - gt_ray)
 
-    # Expand mask for 6 channels
-    mask_expanded = valid_mask.unsqueeze(-1).expand_as(loss)
-    loss = loss * mask_expanded.float()
-
-    num_valid = mask_expanded.sum()
-    if num_valid > 0:
-        loss = loss.sum() / num_valid
-    else:
-        loss = torch.tensor(0.0, device=pred_ray.device, requires_grad=True)
+    # Average over all elements
+    loss = loss.mean()
 
     loss = gamma * loss
     loss = check_and_fix_inf_nan(loss, "ray_loss")
@@ -614,7 +609,9 @@ def compute_ray_from_camera(extrinsics, intrinsics, H, W, device):
         device: Torch device
 
     Returns:
-        ray_map: [B, S, H, W, 6] ray map (t, d) for each pixel
+        ray_map: [B, S, H, W, 6] ray map (d, t) for each pixel
+                 First 3 channels: direction (d)
+                 Last 3 channels: origin/translation (t)
     """
     B, S = extrinsics.shape[:2]
 
@@ -652,7 +649,9 @@ def compute_ray_from_camera(extrinsics, intrinsics, H, W, device):
 
     cam_center_expanded = cam_center[:, :, None, None, :].expand(B, S, H, W, 3)
 
-    ray_map = torch.cat([cam_center_expanded, dirs_world], dim=-1)
+    # Output format: [d, t] - direction first, then origin
+    # This matches the model prediction format
+    ray_map = torch.cat([dirs_world, cam_center_expanded], dim=-1)
 
     return ray_map
 
@@ -846,6 +845,7 @@ class DA3Loss(nn.Module):
         point_alpha=0.2,
         point_valid_range=0.95,
         disable_point_conf=False,
+        point_camera_source="ray",  # "ray" or "gt" - source of camera params for point loss
         # Camera loss
         use_camera=True,
         camera_weight=1.0,
@@ -879,6 +879,7 @@ class DA3Loss(nn.Module):
         self.point_alpha = point_alpha
         self.point_valid_range = point_valid_range
         self.disable_point_conf = disable_point_conf
+        self.point_camera_source = point_camera_source
 
         self.use_camera = use_camera
         self.camera_weight = camera_weight
@@ -950,7 +951,8 @@ class DA3Loss(nn.Module):
             if self.use_gradient and 'loss_grad_depth' in depth_loss_dict:
                 total_loss = total_loss + self.gradient_weight * depth_loss_dict['loss_grad_depth']
 
-        # 2. Ray loss (L_M)    FIXME: noray
+        # 2. Ray loss (L_M)
+        # Ray format: [d, t] - first 3 channels are direction, last 3 are origin
         if self.use_ray and 'ray' in outputs:
             pred_ray = outputs['ray']
 
@@ -965,7 +967,6 @@ class DA3Loss(nn.Module):
             ray_loss_dict = ray_loss(
                 pred_ray=pred_ray,
                 gt_ray=gt_ray,
-                valid_mask=batch['point_masks'],
                 gamma=self.ray_weight,
             )
 
@@ -973,24 +974,53 @@ class DA3Loss(nn.Module):
             loss_dict.update(ray_loss_dict)
 
         # 3. Point loss (L_P)
+        # Per DA3 paper: L_P(D̂ ⊙ d + t, P)
+        # world_point = depth * direction + origin (per-pixel computation)
         if self.use_point:
-            # Compute world points from predicted depth         FIXME: use ray？ 
-            pred_world_points = depth_to_world_points(
-                pred_depth.squeeze(-1) if pred_depth.dim() == 5 else pred_depth,
-                batch['extrinsics'],
-                batch['intrinsics'],
-            )
+            if self.point_camera_source == "ray" and 'ray' in outputs:
+                # Use ray map directly: world_points = depth * d + t
+                # Ray format: [d, t] - first 3 channels are direction, last 3 are origin
+                pred_ray = outputs['ray']
+
+                # Get depth in correct shape
+                depth = pred_depth.squeeze(-1) if pred_depth.dim() == 5 else pred_depth
+
+                # Interpolate ray to match depth resolution if needed
+                if pred_ray.shape[2:4] != depth.shape[2:4]:
+                    B, S = pred_ray.shape[:2]
+                    pred_ray_flat = pred_ray.permute(0, 1, 4, 2, 3).reshape(B * S, 6, pred_ray.shape[2], pred_ray.shape[3])
+                    pred_ray_flat = F.interpolate(
+                        pred_ray_flat,
+                        size=depth.shape[2:4],
+                        mode='bilinear',
+                        align_corners=True
+                    )
+                    pred_ray = pred_ray_flat.reshape(B, S, 6, depth.shape[2], depth.shape[3]).permute(0, 1, 3, 4, 2)
+
+                # Extract direction (d) and origin (t) from ray map
+                ray_d = pred_ray[..., :3]  # [B, S, H, W, 3] - direction
+                ray_t = pred_ray[..., 3:]  # [B, S, H, W, 3] - origin
+
+                # Compute world points: P = D * d + t
+                pred_world_points = depth[..., None] * ray_d + ray_t  # [B, S, H, W, 3]
+            else:
+                # Fall back to GT camera parameters
+                pred_world_points = depth_to_world_points(
+                    pred_depth.squeeze(-1) if pred_depth.dim() == 5 else pred_depth,
+                    batch['extrinsics'],
+                    batch['intrinsics'],
+                )
 
             point_loss_dict = point_loss(
                 pts3d=pred_world_points,
                 pts3d_conf=pred_depth_conf,
                 batch=batch,
-                normalize_pred=True,
+                normalize_pred=False,
                 gamma=self.point_gamma,
                 alpha=self.point_alpha,
                 gradient_loss_type=self.gradient_loss_type if self.use_gradient else None,
                 valid_range=self.point_valid_range,
-                disable_conf=self.disable_point_conf,   # FIXME: point loss?
+                disable_conf=self.disable_point_conf,
                 all_mean=True,
             )
 

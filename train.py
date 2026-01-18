@@ -280,6 +280,7 @@ class Trainer:
             point_alpha=loss_config.get('point_alpha', 0.2),
             point_valid_range=loss_config.get('point_valid_range', 0.95),
             disable_point_conf=loss_config.get('disable_point_conf', False),
+            point_camera_source=loss_config.get('point_camera_source', 'ray'),
             # Camera loss
             use_camera=loss_config.get('use_camera', True),
             camera_weight=loss_config.get('camera_weight', 1.0),

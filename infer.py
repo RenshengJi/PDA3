@@ -41,6 +41,8 @@ def parse_args():
                         help='Save depth maps as .npy files')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use (cuda or cpu)')
+    parser.add_argument('--use_ray_pose', action='store_true',
+                        help='Use ray-based pose estimation instead of CameraDec')
     return parser.parse_args()
 
 
@@ -176,9 +178,10 @@ def compute_metrics(pred_depth, gt_depth, mask):
 
 
 class Inferencer:
-    def __init__(self, config, checkpoint_path, device='cuda'):
+    def __init__(self, config, checkpoint_path, device='cuda', use_ray_pose=False):
         self.config = config
         self.device = torch.device(device)
+        self.use_ray_pose = use_ray_pose
 
         # Setup model
         self.setup_model(checkpoint_path)
@@ -250,7 +253,7 @@ class Inferencer:
             dict: outputs containing 'depth', 'extrinsics', 'intrinsics'
         """
         images = batch['images'].to(self.device)
-        outputs = self.model(images)
+        outputs = self.model(images, use_ray_pose=self.use_ray_pose)
 
         return outputs
 
@@ -383,6 +386,7 @@ def main():
         config,
         checkpoint_path=args.checkpoint,
         device=args.device,
+        use_ray_pose=args.use_ray_pose,
     )
 
     # Run inference

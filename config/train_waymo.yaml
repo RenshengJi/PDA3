@@ -25,8 +25,8 @@ model:
 
 # Teacher model configuration (for knowledge distillation)
 # Per user request: Use DA3 as teacher (since DA3-Teacher is not open-sourced)
-teacher:
-  enabled: false  # Set to true to enable teacher-student distillation
+teacher: 
+  enabled: true  # Set to true to enable teacher-student distillation   FIXME: repeat
   # Teacher checkpoint (defaults to model.pretrained if not specified)
   checkpoint: "checkpoints/model.safetensors"
 
@@ -107,6 +107,8 @@ loss:
   point_alpha: 0.2          # α - confidence regularization weight
   point_valid_range: 0.95   # Filter top 5% outliers
   disable_point_conf: false # Set to true to disable confidence weighting
+  # Camera source for Point Loss: "ray" (use ray-derived params, per DA3 paper) or "gt" (use GT params)
+  point_camera_source: "ray"
 
   # Camera loss: L1 on camera pose encoding
   # Paper uses β=1.0 for camera loss weight
@@ -120,8 +122,8 @@ loss:
   # Teacher model usage (per DA3 paper)
   # Teacher generates pseudo-depth labels to REPLACE GT depth after switch_step
   # Paper: Supervision switches from GT to teacher labels at 120k steps (60% of 200k)
-  use_teacher: false                # Set to true to enable
-  switch_to_teacher_step: 120000    # Step to switch from GT to teacher labels
+  use_teacher: true                # Set to true to enable
+  switch_to_teacher_step: 0    # Step to switch from GT to teacher labels
 
 # Logging
 log_interval: 10

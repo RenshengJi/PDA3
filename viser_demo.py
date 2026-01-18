@@ -46,6 +46,8 @@ def parse_args():
                         help='Initial confidence percentile threshold (0-100)')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug mode with debugpy')
+    parser.add_argument('--use_ray_pose', action='store_true',
+                        help='Use ray-based pose estimation instead of CameraDec')
     return parser.parse_args()
 
 
@@ -107,9 +109,10 @@ def transform_points(points, extrinsics):
 
 
 class Visualizer:
-    def __init__(self, config, checkpoint_path, device='cuda'):
+    def __init__(self, config, checkpoint_path, device='cuda', use_ray_pose=False):
         self.config = config
         self.device = torch.device(device)
+        self.use_ray_pose = use_ray_pose
         self.setup_model(checkpoint_path)
 
     def setup_model(self, checkpoint_path):
@@ -163,7 +166,7 @@ class Visualizer:
         batch = collate_fn([sample])
         images = batch['images'].to(self.device)
 
-        outputs = self.model(images)
+        outputs = self.model(images, use_ray_pose=self.use_ray_pose)
 
         return {
             'pred_depth': outputs['depth'].cpu().numpy()[0],
@@ -193,6 +196,7 @@ def main():
         config,
         checkpoint_path=args.checkpoint,
         device=args.device,
+        use_ray_pose=args.use_ray_pose,
     )
 
     dataset = visualizer.setup_dataloader(args.split)

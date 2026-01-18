@@ -25,6 +25,7 @@ from .cam_dec import CameraDec
 from .cam_enc import CameraEnc
 from .utils.transform import pose_encoding_to_extri_intri
 from .utils.geometry import affine_inverse, as_homogeneous
+from .utils.ray_utils import get_extrinsic_from_camray
 
 
 class DepthAnything3Net(nn.Module):
@@ -119,6 +120,7 @@ class DepthAnything3Net(nn.Module):
         extrinsics: Optional[torch.Tensor] = None,
         intrinsics: Optional[torch.Tensor] = None,
         export_feat_layers: List[int] = [],
+        use_ray_pose: bool = False,
     ) -> AdDict:
         """Forward pass through the network.
 
@@ -127,11 +129,14 @@ class DepthAnything3Net(nn.Module):
             extrinsics: Camera extrinsics [B, S, 4, 4] (optional, for camera encoder)
             intrinsics: Camera intrinsics [B, S, 3, 3] (optional, for camera encoder)
             export_feat_layers: List of layer indices to extract features from
+            use_ray_pose: If True, use ray-based pose estimation instead of CameraDec
 
         Returns:
             Dictionary containing:
                 - depth: Predicted depth maps [B, S, H, W]
                 - depth_conf: Depth confidence [B, S, H, W]
+                - ray: Ray map [B, S, H, W, 7] (if use_ray_pose or keep_ray)
+                - ray_conf: Ray confidence [B, S, H, W] (if use_ray_pose or keep_ray)
                 - extrinsics: Camera extrinsics [B, S, 4, 4] (if predict_camera)
                 - intrinsics: Camera intrinsics [B, S, 3, 3] (if predict_camera)
         """
@@ -152,7 +157,11 @@ class DepthAnything3Net(nn.Module):
         # Process features through heads
         with torch.autocast(device_type=x.device.type, enabled=False):
             output = self._process_depth_head(feats, H, W)
-            output = self._process_camera_estimation(feats, H, W, output)
+            # Choose between ray-based pose estimation and CameraDec
+            if use_ray_pose:
+                output = self._process_ray_pose_estimation(output, H, W)
+            else:
+                output = self._process_camera_estimation(feats, H, W, output)
 
         # Extract auxiliary features if requested
         output.aux = self._extract_auxiliary_features(aux_feats, export_feat_layers, H, W)
@@ -168,16 +177,16 @@ class DepthAnything3Net(nn.Module):
     def _process_camera_estimation(
         self, feats: List[torch.Tensor], H: int, W: int, output: AdDict
     ) -> AdDict:
-        """Process camera pose estimation if camera decoder is available."""
+        """Process camera pose estimation using CameraDec.
+
+        Note: Ray output is preserved for potential use in loss computation.
+        """
         if self.cam_dec is not None:
             # Camera tokens are the second element of the last feature
             pose_enc = self.cam_dec(feats[-1][1])
 
-            # Remove ray information as it's not needed for pose estimation
-            if "ray" in output:
-                del output.ray
-            if "ray_conf" in output:
-                del output.ray_conf
+            # Note: We keep ray and ray_conf in output for loss computation
+            # (previously they were deleted here)
 
             # Convert pose encoding to extrinsics and intrinsics
             c2w, ixt = pose_encoding_to_extri_intri(pose_enc, (H, W))
@@ -185,6 +194,39 @@ class DepthAnything3Net(nn.Module):
             c2w = as_homogeneous(c2w)
             output.extrinsics = affine_inverse(c2w)
             output.intrinsics = ixt
+
+        return output
+
+    def _process_ray_pose_estimation(
+        self, output: AdDict, H: int, W: int
+    ) -> AdDict:
+        """Process camera pose estimation using ray map.
+
+        Uses ray predictions to compute camera extrinsics and intrinsics.
+        Note: get_extrinsic_from_camray returns c2w (camera-to-world) format,
+        so we only need one affine_inverse to convert to w2c.
+        """
+        if "ray" in output and "ray_conf" in output:
+            # Get extrinsics from ray map (returns c2w format)
+            pred_c2w, pred_focal_lengths, pred_principal_points = get_extrinsic_from_camray(
+                output.ray,
+                output.ray_conf,
+                output.ray.shape[-3],  # num_patches_y
+                output.ray.shape[-2],  # num_patches_x
+            )
+
+            # Build intrinsic matrix
+            B, S = pred_c2w.shape[:2]
+            pred_intrinsic = torch.eye(3, 3, device=pred_c2w.device, dtype=pred_c2w.dtype)
+            pred_intrinsic = pred_intrinsic[None, None].repeat(B, S, 1, 1).clone()
+            pred_intrinsic[:, :, 0, 0] = pred_focal_lengths[:, :, 0] / 2 * W
+            pred_intrinsic[:, :, 1, 1] = pred_focal_lengths[:, :, 1] / 2 * H
+            pred_intrinsic[:, :, 0, 2] = pred_principal_points[:, :, 0] * W * 0.5
+            pred_intrinsic[:, :, 1, 2] = pred_principal_points[:, :, 1] * H * 0.5
+
+            # Convert c2w to w2c for output (to be consistent with CameraDec output)
+            output.extrinsics = affine_inverse(pred_c2w)
+            output.intrinsics = pred_intrinsic
 
         return output
 
