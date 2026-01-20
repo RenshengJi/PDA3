@@ -2,6 +2,10 @@
 3D Visualization for comparing GT depth, teacher depth (no align), and teacher depth (aligned).
 Uses real teacher model (DepthAnything3Net) for inference.
 Uses Viser to display point clouds side-by-side for alignment quality inspection.
+
+Supports two alignment methods:
+1. Least Squares (scale + shift): Fast, global alignment
+2. ARAP (As-Rigid-As-Possible): Per-pixel scale map with smoothness constraint
 """
 import os
 import sys
@@ -11,10 +15,15 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import cv2
 import viser
 import viser.transforms as viser_tf
+import einops
+from sklearn.linear_model import LinearRegression, RANSACRegressor
+from sklearn.base import BaseEstimator, RegressorMixin
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -23,6 +32,226 @@ from src.model import DepthAnything3Net
 from src.losses.loss import align_depth_least_squares
 from src.dataset import WaymoDataset
 from src.dataset.waymo import collate_fn
+
+try:
+    import utils3d
+    HAS_UTILS3D = True
+except ImportError:
+    HAS_UTILS3D = False
+    print("Warning: utils3d not installed. Edge mask computation will be disabled.")
+
+
+def point_padding(points):
+    """Add homogeneous coordinate (1) to points. Nx2 or Nx3 -> Nx3 or Nx4"""
+    return torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)
+
+
+class ConstrainedLinearRegression(BaseEstimator, RegressorMixin):
+    """Custom linear regression with coefficient constraints."""
+    def __init__(self, min_coef=1e-8, max_bias=[0.0, 1.0]):
+        self.min_coef = min_coef
+        self.max_bias = max_bias
+        self.model = LinearRegression()
+
+    def fit(self, X, y):
+        self.model.fit(X, y)
+        if self.model.coef_[0] < self.min_coef:
+            self.model.coef_[0] = self.min_coef
+        self.model.intercept_[0] = np.clip(self.model.intercept_[0], self.max_bias[0], self.max_bias[1])
+        return self
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+
+class ARAPDepthAlignment(nn.Module):
+    """
+    ARAP (As-Rigid-As-Possible) Depth Alignment.
+
+    This method optimizes a per-pixel scale map instead of just global scale+shift,
+    which can produce better alignment results, especially for complex scenes.
+
+    The method:
+    1. Uses RANSAC to get initial scale+shift in inverse depth space
+    2. Handles near and far regions separately
+    3. Optimizes a per-pixel scale map with ARAP smoothness constraint
+    """
+    def __init__(self, mono_depth, guidance_depth, valid_mask, mono_depth_mask, K, w2c, points2d, device, depth_filter,
+                 smoothing_kernel_size=3, lambda_arap=0.1, max_d=100.0, eps=1e-6):
+        super(ARAPDepthAlignment, self).__init__()
+
+        # Initial alignment using RANSAC in inverse depth space
+        ransac = RANSACRegressor(
+            min_samples=100,
+            estimator=ConstrainedLinearRegression(min_coef=1e-4, max_bias=[-10.0, 10.0]),
+            stop_probability=0.995,
+            random_state=42
+        )
+        near_mask = valid_mask & (mono_depth <= depth_filter)
+        far_mask = valid_mask & (mono_depth > depth_filter)
+
+        self.device = device
+        self.smoothing_kernel_size = smoothing_kernel_size
+        self.smoothing_kernel = torch.ones((1, 1, smoothing_kernel_size, smoothing_kernel_size), device=device) / (smoothing_kernel_size ** 2)
+
+        mono_inv_depth = 1.0 / mono_depth
+        guidance_inv_depth = 1.0 / guidance_depth
+
+        _ = ransac.fit(mono_inv_depth[near_mask].numpy().reshape(-1, 1), guidance_inv_depth[near_mask].numpy().reshape(-1, 1))
+        k = ransac.estimator_.model.coef_[0][0]
+        b = ransac.estimator_.model.intercept_[0]
+
+        self.max_d = max_d
+        self.mono_depth = mono_depth
+        self.mono_depth_aligned = 1.0 / torch.clamp_min((1.0 / torch.clamp_min(mono_depth, eps)) * k + b, eps)
+        self.mono_depth_aligned = torch.clamp_max(self.mono_depth_aligned, self.max_d)
+        self.mono_depth_aligned[~mono_depth_mask] = 0
+
+        if far_mask.float().mean() >= 0.05:
+            _ = ransac.fit(mono_depth[far_mask].numpy().reshape(-1, 1), guidance_depth[far_mask].numpy().reshape(-1, 1))
+            k2 = ransac.estimator_.model.coef_[0][0]
+            b2 = ransac.estimator_.model.intercept_[0]
+
+            far_aligned_depth = mono_depth * k2 + b2
+            far_aligned_depth = torch.clip(far_aligned_depth, 0.05, self.max_d)
+            far_aligned_depth[~mono_depth_mask] = 0
+            combined_mask = (mono_depth > depth_filter) & mono_depth_mask & (far_aligned_depth > self.mono_depth_aligned)
+            self.mono_depth_aligned[combined_mask] = far_aligned_depth[combined_mask]
+
+        depth_range = self.mono_depth_aligned.unique()
+        if len(depth_range) > 1:
+            print(f"Depth Range after RANSAC: [{depth_range[1].item():.2f}, {depth_range[-1].item():.2f}]")
+
+        self.aligned_depth = self.mono_depth_aligned.to(self.device)
+        self.guidance_depth = guidance_depth.to(self.device)
+        self.valid_mask = valid_mask.to(self.device)
+        self.mono_depth_mask = mono_depth_mask.to(self.device)
+        self.K = K.to(self.device)
+        self.w2c = w2c.to(self.device)
+        self.points2d = points2d.to(self.device)
+        self.mono_depth = self.mono_depth.to(self.device)
+
+        # Initialize per-pixel scale map (starts at 1.0)
+        self.sc_map = nn.Parameter(torch.ones_like(self.aligned_depth).float(), requires_grad=True)
+        self.lambda_arap = lambda_arap
+
+        self.to(device)
+        self.params = [p for p in self.parameters() if p.requires_grad]
+
+    def depth2pcd(self, depth):
+        """Convert depth map to 3D point cloud."""
+        points3d = self.w2c.inverse() @ point_padding((self.K.inverse() @ self.points2d.T).T * depth.reshape(-1, 1)).T
+        points3d = points3d.T[:, :3]
+        return points3d
+
+    def return_depth(self):
+        """Return the final aligned depth (base alignment * per-pixel scale)."""
+        return torch.clip(self.aligned_depth * self.sc_map, 0, self.max_d)
+
+    def fit(self, lr, niter):
+        """Optimize the per-pixel scale map."""
+        optimizer = torch.optim.Adam(self.params, lr=lr, betas=(0.9, 0.95))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=niter, eta_min=1e-4)
+
+        for i in range(niter):
+            optimizer.zero_grad()
+
+            aligned_points = self.depth2pcd(self.aligned_depth * self.sc_map)[self.valid_mask.reshape(-1)]
+            guidance_points = self.depth2pcd(self.guidance_depth)[self.valid_mask.reshape(-1)]
+
+            l1_loss = F.l1_loss(aligned_points, guidance_points, reduction="mean")
+
+            # Apply smoothing filter to sc_map
+            sc_map_reshaped = self.sc_map.unsqueeze(0).unsqueeze(0)
+            sc_map_smoothed = F.conv2d(
+                sc_map_reshaped,
+                self.smoothing_kernel,
+                padding=self.smoothing_kernel_size // 2
+            ).squeeze(0).squeeze(0)
+
+            # ARAP loss (smoothness constraint)
+            arap_loss = torch.abs(sc_map_smoothed - self.sc_map).mean()
+
+            loss = l1_loss + arap_loss * self.lambda_arap
+            loss.backward()
+
+            optimizer.step()
+            scheduler.step()
+
+            if (i + 1) % 100 == 0:
+                print(f"ARAP Alignment - L1: {l1_loss.item():.4f}, ARAP: {arap_loss.item() * self.lambda_arap:.4f}, Step: {i + 1}/{niter}")
+
+        optimizer.zero_grad()
+
+
+def run_arap_alignment(mono_depth, guidance_depth, valid_mask, mono_depth_mask,
+                       intrinsics, extrinsics, device='cuda',
+                       depth_filter_multiplier=8.0, smoothing_kernel_size=3,
+                       lambda_arap=0.1, max_d=100.0, lr=1e-3, niter=500):
+    """
+    Run ARAP depth alignment.
+
+    Args:
+        mono_depth: [H, W] mono/teacher depth (torch tensor)
+        guidance_depth: [H, W] guidance/GT depth (torch tensor)
+        valid_mask: [H, W] initial valid mask for guidance depth
+        mono_depth_mask: [H, W] valid mask for mono depth
+        intrinsics: [3, 3] camera intrinsics (torch tensor)
+        extrinsics: [4, 4] camera extrinsics w2c (torch tensor)
+        device: computation device
+        depth_filter_multiplier: multiplier for median depth to separate near/far
+        smoothing_kernel_size: kernel size for ARAP smoothness
+        lambda_arap: weight for ARAP smoothness constraint
+        max_d: maximum depth value
+        lr: learning rate
+        niter: number of optimization iterations
+
+    Returns:
+        aligned_depth: [H, W] aligned depth (numpy array)
+        edge_mask: [H, W] edge mask for filtering unreliable regions (numpy array)
+    """
+    H, W = mono_depth.shape
+
+    # Prepare 2D points grid
+    x = torch.arange(W).float()
+    y = torch.arange(H).float()
+    points = torch.stack(torch.meshgrid(x, y, indexing='ij'), -1)
+    points = einops.rearrange(points, 'w h c -> (h w) c')
+    points = point_padding(points)
+
+    # Compute edge mask for mono depth
+    if HAS_UTILS3D:
+        mono_edge_mask = ~torch.from_numpy(utils3d.numpy.depth_edge(mono_depth.numpy(), rtol=0.05)).bool()
+    else:
+        mono_edge_mask = torch.ones_like(mono_depth).bool()
+
+    # Compute depth filter threshold (separate near and far)
+    depth_filter = torch.median(mono_depth[mono_depth > 0]) * depth_filter_multiplier
+
+    # Combine masks
+    combined_valid_mask = valid_mask & mono_depth_mask & mono_edge_mask
+
+    # Create and run ARAP alignment
+    align_optimizer = ARAPDepthAlignment(
+        mono_depth, guidance_depth, combined_valid_mask, mono_depth_mask,
+        intrinsics, extrinsics, points, device,
+        depth_filter=depth_filter,
+        smoothing_kernel_size=smoothing_kernel_size,
+        lambda_arap=lambda_arap,
+        max_d=max_d
+    )
+
+    align_optimizer.fit(lr=lr, niter=niter)
+    aligned_depth = align_optimizer.return_depth().detach().cpu()
+
+    # Compute edge mask for aligned depth
+    if HAS_UTILS3D:
+        aligned_edge_mask = ~torch.from_numpy(utils3d.numpy.depth_edge(aligned_depth.numpy(), rtol=0.1)).bool()
+        final_edge_mask = mono_edge_mask & aligned_edge_mask
+    else:
+        final_edge_mask = mono_edge_mask
+
+    return aligned_depth.numpy(), final_edge_mask.numpy()
 
 
 def parse_args():
@@ -249,6 +478,7 @@ def main():
         show_gt = server.gui.add_checkbox("Show GT (Red)", initial_value=True)
         show_teacher_raw = server.gui.add_checkbox("Show Teacher Raw (Green)", initial_value=False)  # Default off since scale differs
         show_teacher_aligned = server.gui.add_checkbox("Show Teacher Aligned (Blue)", initial_value=True)
+        teacher_dense_mode = server.gui.add_checkbox("Teacher Dense Mode", initial_value=True)  # Show dense point cloud for teacher
         overlay_mode = server.gui.add_checkbox("Overlay Mode (no offset)", initial_value=True)  # Overlay by default
         point_size_slider = server.gui.add_slider(
             "Point Size",
@@ -271,8 +501,21 @@ def main():
             step=1,
             initial_value=0,
         )
+        teacher_max_points_slider = server.gui.add_slider(
+            "Teacher Max Points (dense)",
+            min=10000,
+            max=200000,
+            step=10000,
+            initial_value=100000,
+        )
 
     with server.gui.add_folder("Alignment Parameters"):
+        alignment_method = server.gui.add_dropdown(
+            "Alignment Method",
+            options=["Least Squares (scale+shift)", "ARAP (per-pixel scale)"],
+            initial_value="Least Squares (scale+shift)",
+        )
+        # Least Squares parameters
         with_shift_checkbox = server.gui.add_checkbox("With Shift (Affine)", initial_value=args.with_shift)
         use_ransac_checkbox = server.gui.add_checkbox("Use RANSAC", initial_value=args.use_ransac)
         ransac_iters_slider = server.gui.add_slider(
@@ -283,8 +526,46 @@ def main():
             initial_value=args.ransac_iters,
         )
 
+    with server.gui.add_folder("ARAP Parameters"):
+        arap_niter_slider = server.gui.add_slider(
+            "ARAP Iterations",
+            min=100,
+            max=1000,
+            step=50,
+            initial_value=500,
+        )
+        arap_lr_slider = server.gui.add_slider(
+            "ARAP Learning Rate",
+            min=0.0001,
+            max=0.01,
+            step=0.0001,
+            initial_value=0.001,
+        )
+        arap_lambda_slider = server.gui.add_slider(
+            "ARAP Smoothness (lambda)",
+            min=0.01,
+            max=1.0,
+            step=0.01,
+            initial_value=0.1,
+        )
+        arap_kernel_slider = server.gui.add_slider(
+            "ARAP Kernel Size",
+            min=3,
+            max=9,
+            step=2,
+            initial_value=3,
+        )
+        depth_filter_mult_slider = server.gui.add_slider(
+            "Near/Far Depth Filter Mult",
+            min=2.0,
+            max=20.0,
+            step=1.0,
+            initial_value=8.0,
+        )
+
     # Info display
     with server.gui.add_folder("Alignment Info"):
+        alignment_method_text = server.gui.add_text("Method", initial_value="Least Squares")
         scale_text = server.gui.add_text("Scale", initial_value="N/A")
         shift_text = server.gui.add_text("Shift", initial_value="N/A")
         gt_depth_range_text = server.gui.add_text("GT Depth Range", initial_value="N/A")
@@ -357,30 +638,72 @@ def main():
         # Resize image to match depth
         image_resized = cv2.resize(image, (W_d, H_d))
 
-        # Align teacher depth to GT using least squares with RANSAC
-        # Use tensors for alignment function - ensure all on same device (CPU for visualization)
-        gt_depth_tensor = cached_data['gt_depth_tensor'][:, frame_idx:frame_idx+1].cpu()  # [1, 1, H, W]
-        teacher_depth_tensor = cached_data['teacher_depth_tensor'][:, frame_idx:frame_idx+1].cpu()  # [1, 1, H, W]
-        valid_mask_tensor = None
-        if cached_data['point_masks_tensor'] is not None:
-            valid_mask_tensor = cached_data['point_masks_tensor'][:, frame_idx:frame_idx+1].bool().cpu()
+        # Select alignment method
+        use_arap = alignment_method.value == "ARAP (per-pixel scale)"
 
-        aligned_depth_tensor, scale, shift = align_depth_least_squares(
-            teacher_depth_tensor,
-            gt_depth_tensor,
-            valid_mask=valid_mask_tensor,
-            with_shift=with_shift_checkbox.value,
-            use_ransac=use_ransac_checkbox.value,
-            ransac_iters=int(ransac_iters_slider.value),
-        )
+        if use_arap:
+            # ARAP alignment: per-pixel scale map optimization
+            print(f"Running ARAP alignment (niter={int(arap_niter_slider.value)}, lr={arap_lr_slider.value:.4f})...")
+            alignment_method_text.value = "ARAP"
 
-        teacher_depth_aligned = aligned_depth_tensor.squeeze().cpu().numpy()
+            # Prepare tensors for ARAP
+            mono_depth_t = torch.from_numpy(teacher_depth_raw).float()
+            guidance_depth_t = torch.from_numpy(gt_depth).float()
+            valid_mask_t = torch.from_numpy(point_mask).bool() if point_mask is not None else (guidance_depth_t > 0.1)
+            mono_depth_mask_t = mono_depth_t > 0.01
+            intrinsics_t = torch.from_numpy(intrinsics_scaled).float()
+            extrinsics_t = torch.from_numpy(extrinsics).float()
 
-        # Update info display
-        scale_val = scale.item() if hasattr(scale, 'item') else float(scale)
-        shift_val = shift.item() if hasattr(shift, 'item') else float(shift)
-        scale_text.value = f"{scale_val:.4f}"
-        shift_text.value = f"{shift_val:.4f}"
+            teacher_depth_aligned, edge_mask = run_arap_alignment(
+                mono_depth=mono_depth_t,
+                guidance_depth=guidance_depth_t,
+                valid_mask=valid_mask_t,
+                mono_depth_mask=mono_depth_mask_t,
+                intrinsics=intrinsics_t,
+                extrinsics=extrinsics_t,
+                device=args.device,
+                depth_filter_multiplier=depth_filter_mult_slider.value,
+                smoothing_kernel_size=int(arap_kernel_slider.value),
+                lambda_arap=arap_lambda_slider.value,
+                max_d=float(max_depth),
+                lr=arap_lr_slider.value,
+                niter=int(arap_niter_slider.value),
+            )
+
+            # For ARAP, scale/shift are not single values
+            scale_text.value = "Per-pixel"
+            shift_text.value = "N/A (ARAP)"
+
+            print("ARAP alignment complete.")
+        else:
+            # Least Squares alignment: global scale + shift
+            alignment_method_text.value = "Least Squares"
+
+            # Use tensors for alignment function - ensure all on same device (CPU for visualization)
+            gt_depth_tensor = cached_data['gt_depth_tensor'][:, frame_idx:frame_idx+1].cpu()  # [1, 1, H, W]
+            teacher_depth_tensor = cached_data['teacher_depth_tensor'][:, frame_idx:frame_idx+1].cpu()  # [1, 1, H, W]
+            valid_mask_tensor = None
+            if cached_data['point_masks_tensor'] is not None:
+                valid_mask_tensor = cached_data['point_masks_tensor'][:, frame_idx:frame_idx+1].bool().cpu()
+
+            aligned_depth_tensor, scale, shift = align_depth_least_squares(
+                teacher_depth_tensor,
+                gt_depth_tensor,
+                valid_mask=valid_mask_tensor,
+                with_shift=with_shift_checkbox.value,
+                use_ransac=use_ransac_checkbox.value,
+                ransac_iters=int(ransac_iters_slider.value),
+            )
+
+            teacher_depth_aligned = aligned_depth_tensor.squeeze().cpu().numpy()
+
+            # Update info display
+            scale_val = scale.item() if hasattr(scale, 'item') else float(scale)
+            shift_val = shift.item() if hasattr(shift, 'item') else float(shift)
+            scale_text.value = f"{scale_val:.4f}"
+            shift_text.value = f"{shift_val:.4f}"
+
+            print(f"Least Squares alignment: scale={scale_val:.4f}, shift={shift_val:.4f}")
 
         # Compute depth ranges for valid regions
         valid_gt = gt_depth[point_mask] if point_mask is not None else gt_depth[gt_depth > 0.1]
@@ -391,7 +714,6 @@ def main():
         teacher_depth_range_text.value = f"[{valid_teacher.min():.2f}, {valid_teacher.max():.2f}]"
         aligned_depth_range_text.value = f"[{valid_aligned.min():.2f}, {valid_aligned.max():.2f}]"
 
-        print(f"Alignment: scale={scale_val:.4f}, shift={shift_val:.4f}")
         print(f"  GT depth range: [{valid_gt.min():.2f}, {valid_gt.max():.2f}]")
         print(f"  Teacher depth range: [{valid_teacher.min():.2f}, {valid_teacher.max():.2f}]")
         print(f"  Aligned depth range: [{valid_aligned.min():.2f}, {valid_aligned.max():.2f}]")
@@ -439,8 +761,15 @@ def main():
         if show_teacher_raw.value:
             # Use larger max_depth for raw teacher since it's not aligned
             raw_max_depth = max_depth * 3  # Teacher depth might have very different scale
+            # For teacher, use dense mask (all valid depth pixels) or sparse lidar mask
+            if teacher_dense_mode.value:
+                teacher_raw_mask = None  # depth_to_points will use depth > 0.1 as mask
+                teacher_max_pts = int(teacher_max_points_slider.value)
+            else:
+                teacher_raw_mask = point_mask
+                teacher_max_pts = args.max_points
             raw_points, raw_pixel_coords = depth_to_points(
-                teacher_depth_raw, intrinsics_scaled, raw_max_depth, args.max_points, point_mask
+                teacher_depth_raw, intrinsics_scaled, raw_max_depth, teacher_max_pts, teacher_raw_mask
             )
             if len(raw_points) > 0:
                 raw_points_world = transform_points(raw_points, extrinsics)
@@ -463,8 +792,15 @@ def main():
 
         # 3. Teacher depth (aligned) point cloud (BLUE) - offset right
         if show_teacher_aligned.value:
+            # For teacher, use dense mask (all valid depth pixels) or sparse lidar mask
+            if teacher_dense_mode.value:
+                teacher_aligned_mask = None  # depth_to_points will use depth > 0.1 as mask
+                teacher_max_pts = int(teacher_max_points_slider.value)
+            else:
+                teacher_aligned_mask = point_mask
+                teacher_max_pts = args.max_points
             aligned_points, aligned_pixel_coords = depth_to_points(
-                teacher_depth_aligned, intrinsics_scaled, max_depth, args.max_points, point_mask
+                teacher_depth_aligned, intrinsics_scaled, max_depth, teacher_max_pts, teacher_aligned_mask
             )
             if len(aligned_points) > 0:
                 aligned_points_world = transform_points(aligned_points, extrinsics)
@@ -520,6 +856,14 @@ def main():
     def _(_):
         update_visualization()
 
+    @teacher_dense_mode.on_update
+    def _(_):
+        update_visualization()
+
+    @teacher_max_points_slider.on_update
+    def _(_):
+        update_visualization()
+
     @point_size_slider.on_update
     def _(_):
         update_visualization()
@@ -544,11 +888,44 @@ def main():
     def _(_):
         update_visualization()
 
+    @alignment_method.on_update
+    def _(_):
+        update_visualization()
+
+    @arap_niter_slider.on_update
+    def _(_):
+        # Only update if ARAP is selected (optimization takes time)
+        if alignment_method.value == "ARAP (per-pixel scale)":
+            update_visualization()
+
+    @arap_lr_slider.on_update
+    def _(_):
+        if alignment_method.value == "ARAP (per-pixel scale)":
+            update_visualization()
+
+    @arap_lambda_slider.on_update
+    def _(_):
+        if alignment_method.value == "ARAP (per-pixel scale)":
+            update_visualization()
+
+    @arap_kernel_slider.on_update
+    def _(_):
+        if alignment_method.value == "ARAP (per-pixel scale)":
+            update_visualization()
+
+    @depth_filter_mult_slider.on_update
+    def _(_):
+        if alignment_method.value == "ARAP (per-pixel scale)":
+            update_visualization()
+
     # Keep server running
     print("\nControls:")
     print("  - GT Depth (Red): Ground truth depth, offset left")
     print("  - Teacher Raw (Green): Real teacher model depth (no alignment), center")
     print("  - Teacher Aligned (Blue): Aligned teacher depth, offset right")
+    print("\nAlignment Methods:")
+    print("  - Least Squares: Fast global scale+shift alignment")
+    print("  - ARAP: Per-pixel scale map with smoothness constraint (slower but more accurate)")
     print("\nPress Ctrl+C to stop the server")
 
     try:
