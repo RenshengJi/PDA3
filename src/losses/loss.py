@@ -469,60 +469,33 @@ def normal_loss(prediction, target, mask, cos_eps=1e-8, conf=None):
 def reg_loss(pts3d, gt_pts3d, valid_mask, gradient_loss_type=None):
     """
     Compute regression loss (L2 norm) with optional gradient loss.
-
-    Separates first frame and other frames for loss computation.
     """
-    first_frame_pts3d = pts3d[:, 0:1, ...]
-    first_frame_gt_pts3d = gt_pts3d[:, 0:1, ...]
-    first_frame_mask = valid_mask[:, 0:1, ...]
-
-    other_frames_pts3d = pts3d[:, 1:, ...]
-    other_frames_gt_pts3d = gt_pts3d[:, 1:, ...]
-    other_frames_mask = valid_mask[:, 1:, ...]
-
     # L2 norm (Euclidean distance)
-    loss_reg_first_frame = torch.norm(
-        first_frame_gt_pts3d[first_frame_mask] - first_frame_pts3d[first_frame_mask], dim=-1)
-    loss_reg_other_frames = torch.norm(
-        other_frames_gt_pts3d[other_frames_mask] - other_frames_pts3d[other_frames_mask], dim=-1)
+    loss_reg = torch.norm(
+        gt_pts3d[valid_mask] - pts3d[valid_mask], dim=-1)
 
     # Optional gradient loss
     if gradient_loss_type == "grad":
-        bb, ss, hh, ww, nc = first_frame_pts3d.shape
-        loss_grad_first_frame = gradient_loss_multi_scale(
-            first_frame_pts3d.reshape(bb*ss, hh, ww, nc),
-            first_frame_gt_pts3d.reshape(bb*ss, hh, ww, nc),
-            first_frame_mask.reshape(bb*ss, hh, ww)
-        )
-        bb, ss, hh, ww, nc = other_frames_pts3d.shape
-        loss_grad_other_frames = gradient_loss_multi_scale(
-            other_frames_pts3d.reshape(bb*ss, hh, ww, nc),
-            other_frames_gt_pts3d.reshape(bb*ss, hh, ww, nc),
-            other_frames_mask.reshape(bb*ss, hh, ww)
+        bb, ss, hh, ww, nc = pts3d.shape
+        loss_grad = gradient_loss_multi_scale(
+            pts3d.reshape(bb*ss, hh, ww, nc),
+            gt_pts3d.reshape(bb*ss, hh, ww, nc),
+            valid_mask.reshape(bb*ss, hh, ww)
         )
     elif gradient_loss_type == "normal":
-        bb, ss, hh, ww, nc = first_frame_pts3d.shape
-        loss_grad_first_frame = gradient_loss_multi_scale(
-            first_frame_pts3d.reshape(bb*ss, hh, ww, nc),
-            first_frame_gt_pts3d.reshape(bb*ss, hh, ww, nc),
-            first_frame_mask.reshape(bb*ss, hh, ww),
-            gradient_loss_fn=normal_loss, scales=3
-        )
-        bb, ss, hh, ww, nc = other_frames_pts3d.shape
-        loss_grad_other_frames = gradient_loss_multi_scale(
-            other_frames_pts3d.reshape(bb*ss, hh, ww, nc),
-            other_frames_gt_pts3d.reshape(bb*ss, hh, ww, nc),
-            other_frames_mask.reshape(bb*ss, hh, ww),
+        bb, ss, hh, ww, nc = pts3d.shape
+        loss_grad = gradient_loss_multi_scale(
+            pts3d.reshape(bb*ss, hh, ww, nc),
+            gt_pts3d.reshape(bb*ss, hh, ww, nc),
+            valid_mask.reshape(bb*ss, hh, ww),
             gradient_loss_fn=normal_loss, scales=3
         )
     else:
-        loss_grad_first_frame = 0
-        loss_grad_other_frames = 0
+        loss_grad = 0
 
-    loss_reg_first_frame = check_and_fix_inf_nan(loss_reg_first_frame, "loss_reg_first_frame")
-    loss_reg_other_frames = check_and_fix_inf_nan(loss_reg_other_frames, "loss_reg_other_frames")
+    loss_reg = check_and_fix_inf_nan(loss_reg, "loss_reg")
 
-    return loss_reg_first_frame, loss_reg_other_frames, loss_grad_first_frame, loss_grad_other_frames
+    return loss_reg, loss_grad
 
 
 def conf_loss(pts3d, pts3d_conf, gt_pts3d, valid_mask, batch,
@@ -548,7 +521,7 @@ def conf_loss(pts3d, pts3d_conf, gt_pts3d, valid_mask, batch,
         gradient_loss_type: Type of gradient loss ("grad" or "normal")
         valid_range: Quantile range for filtering
         disable_conf: Whether to disable confidence weighting
-        all_mean: Whether to average all losses
+        all_mean: Whether to average all losses (unused, kept for compatibility)
         postfix: Suffix for loss names
 
     Returns:
@@ -560,66 +533,34 @@ def conf_loss(pts3d, pts3d_conf, gt_pts3d, valid_mask, batch,
     if normalize_pred:
         pts3d, pred_pts3d_scale = normalize_pointcloud(pts3d, valid_mask)
 
-    loss_reg_first_frame, loss_reg_other_frames, loss_grad_first_frame, loss_grad_other_frames = reg_loss(
+    loss_reg, loss_grad = reg_loss(
         pts3d, gt_pts3d, valid_mask, gradient_loss_type=gradient_loss_type)
 
     if disable_conf:
-        conf_loss_first_frame = gamma * loss_reg_first_frame
-        conf_loss_other_frames = gamma * loss_reg_other_frames
+        conf_loss_val = gamma * loss_reg
     else:
-        first_frame_conf = pts3d_conf[:, 0:1, ...]
-        other_frames_conf = pts3d_conf[:, 1:, ...]
-        first_frame_mask = valid_mask[:, 0:1, ...]
-        other_frames_mask = valid_mask[:, 1:, ...]
-
         # Confidence-weighted loss: gamma * loss * conf - alpha * log(conf)
-        conf_loss_first_frame = gamma * loss_reg_first_frame * \
-            first_frame_conf[first_frame_mask] - alpha * \
-            torch.log(first_frame_conf[first_frame_mask].clamp(min=1e-6))
-        conf_loss_other_frames = gamma * loss_reg_other_frames * \
-            other_frames_conf[other_frames_mask] - alpha * \
-            torch.log(other_frames_conf[other_frames_mask].clamp(min=1e-6))
+        conf_loss_val = gamma * loss_reg * \
+            pts3d_conf[valid_mask] - alpha * \
+            torch.log(pts3d_conf[valid_mask].clamp(min=1e-6))
 
-    if conf_loss_first_frame.numel() > 0 and conf_loss_other_frames.numel() > 0:
+    if conf_loss_val.numel() > 0:
         if valid_range > 0:
-            conf_loss_first_frame = filter_by_quantile(conf_loss_first_frame, valid_range)
-            conf_loss_other_frames = filter_by_quantile(conf_loss_other_frames, valid_range)
+            conf_loss_val = filter_by_quantile(conf_loss_val, valid_range)
 
-        conf_loss_first_frame = check_and_fix_inf_nan(
-            conf_loss_first_frame, f"conf_loss_first_frame{postfix}")
-        conf_loss_other_frames = check_and_fix_inf_nan(
-            conf_loss_other_frames, f"conf_loss_other_frames{postfix}")
+        conf_loss_val = check_and_fix_inf_nan(conf_loss_val, f"conf_loss{postfix}")
+        conf_loss_val = conf_loss_val.mean()
     else:
-        conf_loss_first_frame = pts3d.new_zeros(1, requires_grad=True).squeeze()
-        conf_loss_other_frames = pts3d.new_zeros(1, requires_grad=True).squeeze()
+        conf_loss_val = pts3d.new_zeros(1, requires_grad=True).squeeze()
 
-    if all_mean and conf_loss_first_frame.numel() > 0 and conf_loss_other_frames.numel() > 0:
-        all_conf_loss = torch.cat([conf_loss_first_frame, conf_loss_other_frames])
-        conf_loss_val = all_conf_loss.mean() if all_conf_loss.numel() > 0 else 0
-
-        conf_loss_first_frame = conf_loss_first_frame.mean() if conf_loss_first_frame.numel() > 0 else 0
-        conf_loss_other_frames = conf_loss_other_frames.mean() if conf_loss_other_frames.numel() > 0 else 0
-    else:
-        conf_loss_first_frame = conf_loss_first_frame.mean() if conf_loss_first_frame.numel() > 0 else 0
-        conf_loss_other_frames = conf_loss_other_frames.mean() if conf_loss_other_frames.numel() > 0 else 0
-        conf_loss_val = conf_loss_first_frame + conf_loss_other_frames
-
-    reg_loss_value = (loss_reg_first_frame.mean() if loss_reg_first_frame.numel() > 0 else 0) + \
-               (loss_reg_other_frames.mean() if loss_reg_other_frames.numel() > 0 else 0)
+    reg_loss_value = loss_reg.mean() if loss_reg.numel() > 0 else 0
 
     loss_dict = {
         f"loss_conf{postfix}": conf_loss_val,
         f"loss_reg{postfix}": reg_loss_value,
-        f"loss_reg1{postfix}": loss_reg_first_frame.detach().mean() if isinstance(loss_reg_first_frame, torch.Tensor) and loss_reg_first_frame.numel() > 0 else 0,
-        f"loss_reg2{postfix}": loss_reg_other_frames.detach().mean() if isinstance(loss_reg_other_frames, torch.Tensor) and loss_reg_other_frames.numel() > 0 else 0,
-        f"loss_conf1{postfix}": conf_loss_first_frame,
-        f"loss_conf2{postfix}": conf_loss_other_frames,
     }
 
     if gradient_loss_type is not None:
-        loss_grad = loss_grad_first_frame + loss_grad_other_frames
-        loss_dict[f"loss_grad1{postfix}"] = loss_grad_first_frame
-        loss_dict[f"loss_grad2{postfix}"] = loss_grad_other_frames
         loss_dict[f"loss_grad{postfix}"] = loss_grad
 
     return loss_dict

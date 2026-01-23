@@ -30,8 +30,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.model import DepthAnything3Net
 from src.losses.loss import align_depth_least_squares
-from src.dataset import WaymoDataset
-from src.dataset.waymo import collate_fn
+from src.dataset import WaymoDataset, PhysicalAIAVDataset
+from src.dataset.waymo import collate_fn as waymo_collate_fn
+from src.dataset.physical_ai_av import collate_fn as physical_ai_av_collate_fn
 
 try:
     import utils3d
@@ -258,6 +259,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description='3D Visualization for Depth Alignment Comparison')
     parser.add_argument('--config', type=str, default='config/train_waymo.yaml',
                         help='Path to config file (teacher model config is defined here)')
+    parser.add_argument('--dataset', type=str, default=None,
+                        choices=['waymo', 'physical_ai_av'],
+                        help='Dataset type (default: auto-detect from config)')
     parser.add_argument('--split', type=str, default='train', choices=['train', 'val'],
                         help='Dataset split to use')
     parser.add_argument('--sample_idx', type=int, default=0,
@@ -348,9 +352,14 @@ def transform_points(points, extrinsics):
 
 
 class AlignmentVisualizer:
-    def __init__(self, config, device='cuda'):
+    def __init__(self, config, device='cuda', dataset_type=None):
         self.config = config
         self.device = torch.device(device)
+        # Auto-detect dataset type from config if not specified
+        if dataset_type is None:
+            self.dataset_type = config.get('data', {}).get('dataset_type', 'waymo')
+        else:
+            self.dataset_type = dataset_type
         self.setup_teacher_model()
 
     def setup_teacher_model(self):
@@ -388,7 +397,7 @@ class AlignmentVisualizer:
             param.requires_grad = False
 
     def setup_dataloader(self, split='train'):
-        """Setup dataloader."""
+        """Setup dataloader based on dataset type."""
         data_config = self.config.get('data', {})
 
         if split == 'val':
@@ -396,14 +405,34 @@ class AlignmentVisualizer:
         else:
             root = data_config.get('train_root')
 
-        dataset = WaymoDataset(
-            root=root,
-            valid_camera_id_list=data_config.get('camera_ids', ["1", "2", "3"]),
-            intervals=[2],
-            num_views=data_config.get('num_views', 1),
-            resolution=data_config.get('resolution', 518),
-            split=split,
-        )
+        if self.dataset_type == 'physical_ai_av':
+            dataset = PhysicalAIAVDataset(
+                root=root,
+                valid_camera_list=data_config.get('camera_list', [
+                    "camera_front_wide_120fov",
+                    "camera_front_tele_30fov"
+                ]),
+                intervals=[2],
+                num_views=data_config.get('num_views', 1),
+                resolution=data_config.get('resolution', 518),
+                split=split,
+                use_lidar_depth=data_config.get('use_lidar_depth', True),
+                time_window_ms=data_config.get('time_window_ms', 4),
+                max_clips=data_config.get('max_clips', None),
+            )
+            self.collate_fn = physical_ai_av_collate_fn
+            print(f"Using Physical AI AV dataset from {root}")
+        else:
+            dataset = WaymoDataset(
+                root=root,
+                valid_camera_id_list=data_config.get('camera_ids', ["1", "2", "3"]),
+                intervals=[2],
+                num_views=data_config.get('num_views', 1),
+                resolution=data_config.get('resolution', 518),
+                split=split,
+            )
+            self.collate_fn = waymo_collate_fn
+            print(f"Using Waymo dataset from {root}")
 
         return dataset
 
@@ -444,8 +473,10 @@ def main():
 
     visualizer = AlignmentVisualizer(
         config,
-        device=args.device
+        device=args.device,
+        dataset_type=args.dataset,
     )
+    print(f"Dataset type: {visualizer.dataset_type}")
     dataset = visualizer.setup_dataloader(args.split)
     print(f"Dataset size: {len(dataset)}")
 
@@ -577,7 +608,7 @@ def main():
         nonlocal cached_data
 
         sample = dataset[current_sample_idx]
-        batch = collate_fn([sample])
+        batch = visualizer.collate_fn([sample])
 
         # Get GT data
         images = batch['images']  # [1, S, 3, H, W]

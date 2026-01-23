@@ -1,0 +1,157 @@
+# Training configuration for DA3 with Physical AI AV dataset
+# https://arxiv.org/abs/2511.10647
+#
+# Key features:
+# 1. Camera Input: use_camera_enc enables camera encoding tokens
+# 2. Confidence-weighted depth loss with gradient regularization
+# 3. Ray prediction loss
+# 4. Teacher-student distillation (using DA3 as teacher)
+
+# Model configuration
+model:
+  encoder_name: "vitg"  # Options: vits, vitb, vitl, vitg
+  out_layers: [19, 27, 33, 39]  # vitg layers (vitl uses [11, 15, 19, 23])
+  features: 256
+  out_channels: [256, 512, 1024, 1024]
+  alt_start: 13      # vitg parameter (vitl uses 8)
+  qknorm_start: 13   # vitg parameter (vitl uses 8)
+  rope_start: 13     # vitg parameter (vitl uses 8)
+  predict_camera: true
+  # Camera encoder: enables camera input conditioning (Section 3.2 of paper)
+  # When true, GT camera params are encoded as tokens and injected into transformer
+  use_camera_enc: true
+  # Path to pretrained DA3 weights
+  pretrained: "checkpoints/model.safetensors"
+
+# Teacher model configuration (for knowledge distillation)
+# Per user request: Use DA3 as teacher (since DA3-Teacher is not open-sourced)
+# Teacher model can have different architecture than student
+teacher:
+  enabled: false  # Set to true to enable teacher-student distillation
+  # Teacher model architecture (can differ from student model)
+  encoder_name: "vitg"  # Options: vits, vitb, vitl, vitg
+  out_layers: [19, 27, 33, 39]  # vitg layers (vitl uses [11, 15, 19, 23])
+  features: 256
+  out_channels: [256, 512, 1024, 1024]
+  alt_start: 13      # vitg parameter (vitl uses 8)
+  qknorm_start: 13   # vitg parameter (vitl uses 8)
+  rope_start: 13     # vitg parameter (vitl uses 8)
+  # Teacher checkpoint path
+  checkpoint: "checkpoints/model.safetensors"
+
+# Data configuration - Physical AI AV Dataset
+data:
+  dataset_type: "physical_ai_av"  # Use Physical AI AV dataset
+  # Path to downloaded data directory (where clip_index.parquet is located)
+  train_root: "/data2/ziqi.shi/nvidia"
+  val_root: "/data2/ziqi.shi/nvidia"
+  # Camera list to use - all 7 cameras
+  # Available: camera_front_wide_120fov, camera_front_tele_30fov,
+  #            camera_rear_tele_30fov, camera_cross_left_120fov,
+  #            camera_cross_right_120fov, camera_rear_left_70fov, camera_rear_right_70fov
+  camera_list:
+    - "camera_front_wide_120fov"
+    - "camera_front_tele_30fov"
+    - "camera_rear_tele_30fov"
+    - "camera_cross_left_120fov"
+    - "camera_cross_right_120fov"
+    - "camera_rear_left_70fov"
+    - "camera_rear_right_70fov"
+  # Whether to use LiDAR-derived depth
+  use_lidar_depth: true
+  # Time window (ms) for LiDAR-camera association
+  time_window_ms: 500
+  # Maximum number of clips to use (null = use all available)
+  # Set this to the number of clips you have downloaded
+  max_clips: 100
+  # Frame sampling intervals
+  intervals: [1, 2, 3]
+  # Number of context frames
+  num_views: 1
+  # Image resolution (must be divisible by 14 for ViT patch size)
+  # Paper uses 504x504 as base resolution (504 = 36×14)
+  resolution: 518  # 518 = 37×14
+  # Data loading
+  batch_size: 1
+  num_workers: 16
+
+# Training configuration
+training:
+  num_epochs: 500
+  save_interval: 10
+  val_interval: 5
+  # Camera input configuration (Section 3.2 of paper)
+  # When use_camera_enc is true, camera params are injected as tokens
+  use_camera_input: true
+  # Probability to dropout camera conditioning (paper uses 0.2)
+  # This helps model learn to work both with and without camera info
+  camera_dropout_prob: 0.8
+
+# Optimizer configuration
+optimizer:
+  # Learning rate for encoder (backbone) - lower for finetuning
+  encoder_lr: 1.0e-6
+  # Learning rate for decoder heads
+  decoder_lr: 1.0e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+# Learning rate scheduler
+scheduler:
+  type: "cosine"
+  T_max: 500
+  eta_min: 1.0e-7
+
+# Loss configuration based on DA3 paper Section 3.3
+# Total loss: L = L_D + α*L_grad + L_M + L_P + β*L_C
+loss:
+  # Depth loss: Confidence-weighted L1 with log regularization
+  # L_D = (1/Z) Σ m_p * (D_c * |D̂ - D| - λ * log(D_c))
+  use_depth: true
+  depth_weight: 1.0
+  depth_gamma: 1.0          # γ - confidence loss weight
+  depth_alpha: 0.2          # α - confidence regularization weight (λ in paper)
+  depth_valid_range: 0.95   # Filter top 5% outliers
+  disable_depth_conf: false # Set to true to disable confidence weighting
+
+  # Gradient loss: Edge-aware L1 on depth gradients
+  # L_grad = ||∇_x D̂ - ∇_x D||_1 + ||∇_y D̂ - ∇_y D||_1
+  # Paper uses α=1.0 for gradient loss weight
+  use_gradient: true
+  gradient_weight: 1.0
+  gradient_loss_type: "grad"  # Options: grad, normal
+
+  # Ray loss: L1 on ray predictions (origin + direction)
+  # Each pixel ray r = (t, d) ∈ R^6
+  use_ray: false
+  ray_weight: 1.0
+
+  # Point loss (L_P in paper): 3D point cloud supervision
+  # L_P(D̂⊙d + t, P) - Projects depth to world coords and supervises against GT
+  use_point: false
+  point_weight: 1.0
+  point_gamma: 1.0          # γ - confidence loss weight
+  point_alpha: 0.2          # α - confidence regularization weight
+  point_valid_range: 0.95   # Filter top 5% outliers
+  disable_point_conf: false # Set to true to disable confidence weighting
+  # Camera source for Point Loss: "ray" (use ray-derived params, per DA3 paper) or "gt" (use GT params)
+  point_camera_source: "ray"
+
+  # Camera loss: L1 on camera pose encoding
+  # Paper uses β=1.0 for camera loss weight
+  use_camera: true
+  camera_weight: 1.0
+  camera_loss_type: "l1"  # Options: l1, l2, huber
+  camera_weight_T: 1.0    # Translation weight
+  camera_weight_R: 1.0    # Rotation weight
+  camera_weight_fl: 0.5   # Focal length weight
+
+  # Teacher model usage (per DA3 paper)
+  # Teacher generates pseudo-depth labels to REPLACE GT depth after switch_step
+  # Paper: Supervision switches from GT to teacher labels at 120k steps (60% of 200k)
+  use_teacher: false                # Set to true to enable
+  switch_to_teacher_step: 0    # Step to switch from GT to teacher labels
+
+# Logging
+log_interval: 10
+output_dir: "outputs"

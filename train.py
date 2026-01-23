@@ -30,8 +30,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.model import DepthAnything3Net
 from src.model.utils.transform import extri_intri_to_pose_encoding
 from src.model.utils.geometry import affine_inverse
-from src.dataset import WaymoDataset
-from src.dataset.waymo import collate_fn
+from src.dataset import WaymoDataset, PhysicalAIAVDataset
+from src.dataset.waymo import collate_fn as waymo_collate_fn
+from src.dataset.physical_ai_av import collate_fn as physical_ai_av_collate_fn
 from src.losses import DA3Loss
 
 
@@ -206,16 +207,80 @@ class Trainer:
     def setup_data(self):
         """Setup data loaders."""
         data_config = self.config.get('data', {})
+        dataset_type = data_config.get('dataset_type', 'waymo')
 
-        # Training dataset
-        train_dataset = WaymoDataset(
-            root=data_config.get('train_root'),
-            valid_camera_id_list=data_config.get('camera_ids', ["1", "2", "3"]),
-            intervals=data_config.get('intervals', [1, 2, 3]),
-            num_views=data_config.get('num_views', 4),
-            resolution=data_config.get('resolution', 518),
-            split='train',
-        )
+        # Select dataset class and collate function based on dataset_type
+        if dataset_type == 'physical_ai_av':
+            dataset_class = PhysicalAIAVDataset
+            collate_fn = physical_ai_av_collate_fn
+
+            # Training dataset
+            train_dataset = dataset_class(
+                root=data_config.get('train_root'),
+                valid_camera_list=data_config.get('camera_list', [
+                    "camera_front_wide_120fov",
+                    "camera_front_tele_30fov"
+                ]),
+                intervals=data_config.get('intervals', [1, 2, 3]),
+                num_views=data_config.get('num_views', 4),
+                resolution=data_config.get('resolution', 518),
+                split='train',
+                use_lidar_depth=data_config.get('use_lidar_depth', True),
+                time_window_ms=data_config.get('time_window_ms', 4),
+                max_clips=data_config.get('max_clips', None),
+            )
+
+            # Validation dataset
+            val_root = data_config.get('val_root')
+            if val_root:
+                val_dataset = dataset_class(
+                    root=val_root,
+                    valid_camera_list=data_config.get('camera_list', [
+                        "camera_front_wide_120fov",
+                        "camera_front_tele_30fov"
+                    ]),
+                    intervals=[1],
+                    num_views=data_config.get('num_views', 4),
+                    resolution=data_config.get('resolution', 518),
+                    split='val',
+                    use_lidar_depth=data_config.get('use_lidar_depth', True),
+                    time_window_ms=data_config.get('time_window_ms', 4),
+                    max_clips=data_config.get('max_clips', None),
+                )
+            else:
+                val_dataset = None
+
+        else:  # Default to Waymo dataset
+            dataset_class = WaymoDataset
+            collate_fn = waymo_collate_fn
+
+            # Training dataset
+            train_dataset = dataset_class(
+                root=data_config.get('train_root'),
+                valid_camera_id_list=data_config.get('camera_ids', ["1", "2", "3"]),
+                intervals=data_config.get('intervals', [1, 2, 3]),
+                num_views=data_config.get('num_views', 4),
+                resolution=data_config.get('resolution', 518),
+                split='train',
+            )
+
+            # Validation dataset
+            val_root = data_config.get('val_root')
+            if val_root and os.path.exists(val_root):
+                val_dataset = dataset_class(
+                    root=val_root,
+                    valid_camera_id_list=data_config.get('camera_ids', ["1", "2", "3"]),
+                    intervals=[1],
+                    num_views=data_config.get('num_views', 4),
+                    resolution=data_config.get('resolution', 518),
+                    split='val',
+                )
+            else:
+                val_dataset = None
+
+        if self.rank == 0:
+            print(f"Using dataset: {dataset_type}")
+            print(f"Training samples: {len(train_dataset)}")
 
         if self.distributed:
             train_sampler = DistributedSampler(train_dataset, shuffle=True)
@@ -234,17 +299,8 @@ class Trainer:
         )
         self.train_sampler = train_sampler
 
-        # Validation dataset (optional)
-        val_root = data_config.get('val_root')
-        if val_root and os.path.exists(val_root):
-            val_dataset = WaymoDataset(
-                root=val_root,
-                valid_camera_id_list=data_config.get('camera_ids', ["1", "2", "3"]),
-                intervals=[1],
-                num_views=data_config.get('num_views', 4),
-                resolution=data_config.get('resolution', 518),
-                split='val',
-            )
+        # Setup validation loader
+        if val_dataset is not None:
             self.val_loader = DataLoader(
                 val_dataset,
                 batch_size=1,
@@ -253,6 +309,8 @@ class Trainer:
                 pin_memory=True,
                 collate_fn=collate_fn,
             )
+            if self.rank == 0:
+                print(f"Validation samples: {len(val_dataset)}")
         else:
             self.val_loader = None
 
@@ -575,6 +633,9 @@ def main():
 
     # Load config
     config = load_config(args.config)
+
+    if args.debug:
+        config['data']['num_workers'] = 1
 
     # Create trainer
     trainer = Trainer(
