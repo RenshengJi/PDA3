@@ -28,6 +28,9 @@ class WaymoDataset(Dataset):
         resolution=(518, 518),
         split="train",
         transform=None,
+        sparse_depth_prob=0.0,
+        sparse_depth_keep_ratio=0.1,
+        sparse_depth_keep_ratio_range=(0.05, 0.3),
         **kwargs
     ):
         """
@@ -41,6 +44,13 @@ class WaymoDataset(Dataset):
             resolution: Target image resolution (H, W)
             split: Dataset split ("train", "val", "test")
             transform: Image transform to apply
+            sparse_depth_prob: Probability (0-1) of including sparse depth input
+                              0 = never include sparse depth
+                              1 = always include sparse depth
+            sparse_depth_keep_ratio: Base ratio of valid depth pixels to keep (0-1)
+                                     Additional randomization applied if keep_ratio_range is set
+            sparse_depth_keep_ratio_range: (min, max) for random keep_ratio sampling
+                                          If set, keep_ratio is uniformly sampled from this range
         """
         self.root = root
         self.valid_camera_id_list = valid_camera_id_list
@@ -48,6 +58,9 @@ class WaymoDataset(Dataset):
         self.resolution = resolution if isinstance(resolution, tuple) else (resolution, resolution)
         self.split = split
         self.transform = transform
+        self.sparse_depth_prob = sparse_depth_prob
+        self.sparse_depth_keep_ratio = sparse_depth_keep_ratio
+        self.sparse_depth_keep_ratio_range = sparse_depth_keep_ratio_range
 
         if not isinstance(intervals, list):
             intervals = [intervals]
@@ -120,6 +133,42 @@ class WaymoDataset(Dataset):
 
     def __len__(self):
         return len(self.scene_names)
+
+    def _sparsify_depth(self, depth: torch.Tensor, keep_ratio: float) -> torch.Tensor:
+        """
+        Randomly keep keep_ratio of valid depth pixels, zero out the rest.
+
+        Args:
+            depth: [H, W] depth map with values > 0 for valid pixels
+            keep_ratio: Fraction of valid pixels to keep (0-1)
+                       If None or >= 1.0, return full depth
+
+        Returns:
+            sparse_depth: [H, W] sparse depth map
+        """
+        if keep_ratio is None or keep_ratio >= 1.0:
+            return depth.clone()
+
+        sparse = depth.clone()
+        valid_mask = depth > 0
+        num_valid = valid_mask.sum().item()
+
+        if num_valid == 0:
+            return sparse
+
+        num_keep = max(0, int(num_valid * keep_ratio))
+        num_zero = num_valid - num_keep
+
+        if num_zero > 0:
+            # Get indices of valid pixels
+            valid_indices = valid_mask.nonzero(as_tuple=False)  # [num_valid, 2]
+            # Randomly select which valid pixels to zero out
+            perm = torch.randperm(num_valid, device=depth.device)[:num_zero]
+            zero_idx = valid_indices[perm]
+            # Set selected pixels to zero
+            sparse[zero_idx[:, 0], zero_idx[:, 1]] = 0.0
+
+        return sparse
 
     def _crop_resize(self, image, depthmap, intrinsics, target_size):
         """Crop and resize image, depth and intrinsics to target size."""
@@ -219,7 +268,13 @@ class WaymoDataset(Dataset):
 
     def __getitem__(self, idx):
         """Get a training sample."""
-        rng = np.random.default_rng()
+        # During evaluation/validation (split != 'train'), use deterministic seeding
+        # to ensure same samples get consistent camera/frame selection across calls.
+        # During training, use unseeded RNG for proper randomness.
+        if self.split != 'train':
+            rng = np.random.default_rng(seed=idx)
+        else:
+            rng = np.random.default_rng()
 
         scene_name = self.scene_names[idx]
         scene_dir = osp.join(self.root, scene_name)
@@ -301,6 +356,30 @@ class WaymoDataset(Dataset):
         point_masks = torch.stack([v['valid_mask'] for v in views], dim=0)  # [S, H, W]
         world_points = torch.stack([v['pts3d'] for v in views], dim=0)  # [S, H, W, 3]
 
+        # Generate sparse depths with optional dropout
+        use_sparse_depth = rng.uniform(0, 1) < self.sparse_depth_prob
+        sparse_depths = []
+
+        if use_sparse_depth:
+            # Optionally randomize keep_ratio within the specified range
+            if self.sparse_depth_keep_ratio_range is not None:
+                keep_ratio = rng.uniform(
+                    self.sparse_depth_keep_ratio_range[0],
+                    self.sparse_depth_keep_ratio_range[1]
+                )
+            else:
+                keep_ratio = self.sparse_depth_keep_ratio
+
+            for depth in depths:
+                sparse_d = self._sparsify_depth(depth, keep_ratio)
+                sparse_depths.append(sparse_d)
+        else:
+            # Return zero depths if sparse depth not used
+            for depth in depths:
+                sparse_depths.append(torch.zeros_like(depth))
+
+        sparse_depths = torch.stack(sparse_depths, dim=0)  # [S, H, W]
+
         return {
             "images": images,
             "depths": depths,
@@ -310,6 +389,8 @@ class WaymoDataset(Dataset):
             "world_points": world_points,
             "depth_scale_factor": depth_scale_factor,
             "scene_name": scene_name,
+            "sparse_depths": sparse_depths,
+            "use_sparse_depth": use_sparse_depth,
         }
 
 

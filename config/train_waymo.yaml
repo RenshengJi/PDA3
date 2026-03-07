@@ -3,9 +3,25 @@
 #
 # Key features:
 # 1. Camera Input: use_camera_enc enables camera encoding tokens
-# 2. Confidence-weighted depth loss with gradient regularization
-# 3. Ray prediction loss
-# 4. Teacher-student distillation (using DA3 as teacher)
+# 2. Optional Sparse Depth Input: use_depth_enc enables sparse LiDAR depth conditioning
+# 3. Confidence-weighted depth loss with gradient regularization
+# 4. Ray prediction loss
+# 5. Teacher-student distillation (using DA3 as teacher)
+
+# Sparse depth (LiDAR) input configuration
+sparse_depth:
+  # Enable sparse depth input
+  enabled: true
+  # Probability of providing sparse depth input for a training sample (0-1)
+  # 0.0 = never use sparse depth
+  # 0.5 = 50% of samples get sparse depth
+  # 1.0 = always use sparse depth
+  input_prob: 1.0
+  # Random range for keep_ratio per sample (takes priority over keep_ratio)
+  # Each sample uniformly samples keep_ratio from [min, max]
+  # Set to null to use fixed keep_ratio value instead
+  # Example: [0.05, 0.3] → sample keep_ratio ∈ [5%, 30%] for each sample
+  keep_ratio_range: [0.0, 1.0]
 
 # Model configuration
 model:
@@ -26,15 +42,15 @@ model:
 # Teacher model configuration (for knowledge distillation)
 # Per user request: Use DA3 as teacher (since DA3-Teacher is not open-sourced)
 teacher: 
-  enabled: true  # Set to true to enable teacher-student distillation   FIXME: repeat
+  enabled: false  # Set to true to enable teacher-student distillation   FIXME: repeat
   # Teacher checkpoint (defaults to model.pretrained if not specified)
   checkpoint: "checkpoints/model.safetensors"
 
 # Data configuration
 data:
   # Path to Waymo dataset
-  train_root: "./data/waymo/train_full/"
-  val_root: "./data/waymo/val_full/"
+  train_root: "./data"
+  val_root: "./data"
   # Camera IDs to use (1=FRONT, 2=FRONT_LEFT, 3=FRONT_RIGHT)
   camera_ids: ["1", "2", "3"]
   # Frame sampling intervals
@@ -43,16 +59,16 @@ data:
   num_views: 4
   # Image resolution (must be divisible by 14 for ViT patch size)
   # Paper uses 504x504 as base resolution
-  resolution: 518
+  resolution: 336
   # Data loading
   batch_size: 1
   num_workers: 4
 
 # Training configuration
 training:
-  num_epochs: 100
-  save_interval: 5
-  val_interval: 5
+  num_epochs: 500
+  save_interval: 50
+  val_interval: 500
   # Camera input configuration (Section 3.2 of paper)
   # When use_camera_enc is true, camera params are injected as tokens
   use_camera_input: true
@@ -72,7 +88,7 @@ optimizer:
 # Learning rate scheduler
 scheduler:
   type: "cosine"
-  T_max: 100
+  T_max: 500
   eta_min: 1.0e-7
 
 # Loss configuration based on DA3 paper Section 3.3
@@ -84,7 +100,7 @@ loss:
   depth_weight: 1.0
   depth_gamma: 1.0          # γ - confidence loss weight
   depth_alpha: 0.2          # α - confidence regularization weight (λ in paper)
-  depth_valid_range: 0.95   # Filter top 5% outliers
+  depth_valid_range: 0.98   # Filter top 5% outliers
   disable_depth_conf: false # Set to true to disable confidence weighting
 
   # Gradient loss: Edge-aware L1 on depth gradients
@@ -96,12 +112,12 @@ loss:
 
   # Ray loss: L1 on ray predictions (origin + direction)
   # Each pixel ray r = (t, d) ∈ R^6
-  use_ray: true
+  use_ray: false
   ray_weight: 1.0
 
   # Point loss (L_P in paper): 3D point cloud supervision
   # L_P(D̂⊙d + t, P) - Projects depth to world coords and supervises against GT
-  use_point: true
+  use_point: false
   point_weight: 1.0
   point_gamma: 1.0          # γ - confidence loss weight
   point_alpha: 0.2          # α - confidence regularization weight

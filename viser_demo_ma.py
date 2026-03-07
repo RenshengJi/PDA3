@@ -1,5 +1,5 @@
 """
-3D Visualization of DA3 inference results using Viser.
+3D Visualization of MapAnything inference results using Viser.
 Displays point clouds from predicted depth maps in an interactive 3D viewer.
 Supports confidence-based filtering and per-frame viewing.
 """
@@ -19,16 +19,20 @@ import viser.transforms as viser_tf
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.model import DepthAnything3Net
 from src.dataset import WaymoDataset
 from src.dataset.waymo import collate_fn
 
+# Import MapAnything
+sys.path.insert(0, '/home/ziqi.shi/map-anything')
+from mapanything.models import MapAnything
+from mapanything.utils.image import load_images
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='3D Visualization of DA3 on Waymo')
+    parser = argparse.ArgumentParser(description='3D Visualization of MapAnything on Waymo')
     parser.add_argument('--config', type=str, default='config/train_waymo.yaml',
                         help='Path to config file')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/model.safetensors',
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/mapanything.safetensors',
                         help='Path to model checkpoint')
     parser.add_argument('--split', type=str, default='val', choices=['train', 'val'],
                         help='Dataset split to use')
@@ -46,8 +50,6 @@ def parse_args():
                         help='Initial confidence percentile threshold (0-100)')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug mode with debugpy')
-    parser.add_argument('--use_ray_pose', action='store_true',
-                        help='Use ray-based pose estimation instead of CameraDec')
     parser.add_argument('--use_sparse_depth', action='store_true',
                         help='Enable sparse depth input for visualization')
     parser.add_argument('--sparse_depth_ratio', type=float, default=0.1,
@@ -103,9 +105,24 @@ def depth_to_points_with_conf(depth, conf, intrinsics, conf_threshold_percentile
     return points, pixel_coords
 
 
-def transform_points(points, extrinsics):
-    """Transform points from camera to world coordinate."""
-    c2w = np.linalg.inv(extrinsics)
+def transform_points(points, extrinsics, is_c2w=True):
+    """Transform points from camera to world coordinate.
+
+    Args:
+        points: (N, 3) points in camera frame
+        extrinsics: (4, 4) camera pose matrix
+        is_c2w: if True, extrinsics is camera-to-world; if False, it's world-to-camera
+
+    Returns:
+        (N, 3) points in world frame
+    """
+    if is_c2w:
+        # extrinsics is c2w, so directly apply it
+        c2w = extrinsics
+    else:
+        # extrinsics is w2c (like GT), so invert it
+        c2w = np.linalg.inv(extrinsics)
+
     R = c2w[:3, :3]
     t = c2w[:3, 3]
     points_world = points @ R.T + t
@@ -113,42 +130,31 @@ def transform_points(points, extrinsics):
 
 
 class Visualizer:
-    def __init__(self, config, checkpoint_path, device='cuda', use_ray_pose=False, use_sparse_depth=False):
+    def __init__(self, config, checkpoint_path, device='cuda'):
         self.config = config
         self.device = torch.device(device)
-        self.use_ray_pose = use_ray_pose
-        self.use_sparse_depth = use_sparse_depth
-        self.setup_model(checkpoint_path, use_sparse_depth=use_sparse_depth)
+        self.setup_model(checkpoint_path)
 
-    def setup_model(self, checkpoint_path, use_sparse_depth=False):
+    def setup_model(self, checkpoint_path):
         """Setup model and load checkpoint."""
-        model_config = self.config.get('model', {})
-        sparse_depth_config = self.config.get('sparse_depth', {})
+        # Load MapAnything model from safetensors checkpoint
+        print(f"Loading MapAnything model from {checkpoint_path}...")
 
-        # Enable depth encoder if using sparse depth
-        use_depth_enc = use_sparse_depth or sparse_depth_config.get('enabled', False)
+        from mapanything.utils.hf_utils.hf_helpers import initialize_mapanything_local
 
-        self.model = DepthAnything3Net(
-            encoder_name=model_config.get('encoder_name', 'vitl'),
-            out_layers=model_config.get('out_layers', [11, 15, 19, 23]),
-            features=model_config.get('features', 256),
-            out_channels=model_config.get('out_channels', [256, 512, 1024, 1024]),
-            alt_start=model_config.get('alt_start', 8),
-            qknorm_start=model_config.get('qknorm_start', 8),
-            rope_start=model_config.get('rope_start', 8),
-            predict_camera=model_config.get('predict_camera', True),
-            use_camera_enc=model_config.get('use_camera_enc', False),
-            use_depth_enc=use_depth_enc,
-        )
+        # Use the helper function to initialize from local checkpoint
+        # Note: configs/train.yaml should be relative to map-anything repo
+        mapanything_repo = '/home/ziqi.shi/map-anything'
+        config_path = os.path.join(mapanything_repo, 'configs/train.yaml')
 
-        if checkpoint_path and os.path.exists(checkpoint_path):
-            self.model.load_pretrained(checkpoint_path)
-            print(f"Loaded checkpoint from {checkpoint_path}")
-        else:
-            print(f"Warning: Checkpoint not found at {checkpoint_path}")
+        local_config = {
+            "path": config_path,
+            "checkpoint_path": os.path.abspath(checkpoint_path),
+            "config_overrides": ["model=mapanything"],
+        }
 
-        self.model = self.model.to(self.device)
-        self.model.eval()
+        self.model = initialize_mapanything_local(local_config, device=self.device)
+        print(f"Model loaded successfully")
 
     def setup_dataloader(self, split='val', use_sparse_depth=False, sparse_depth_ratio=0.1):
         """Setup dataloader."""
@@ -175,35 +181,183 @@ class Visualizer:
         return dataset
 
     @torch.no_grad()
-    def infer_sample(self, sample, sparse_depth_ratio=0.1):
+    def infer_sample(self, sample):
         """Run inference on a single sample."""
         batch = collate_fn([sample])
-        images = batch['images'].to(self.device)
+        images = batch['images'].cpu().numpy()  # (B, S, 3, H, W), range [0, 1]
+        extrinsics = batch['extrinsics'].cpu().numpy()  # (B, S, 4, 4)
+        intrinsics = batch['intrinsics'].cpu().numpy()  # (B, S, 3, 3)
+        sparse_depths_batch = batch.get('sparse_depths', None)  # (B, S, H, W)
+        depth_scale_factor = batch.get('depth_scale_factor', None)
 
-        # Prepare sparse depth input if sample has sparse depths
-        sparse_depth_input = None
-        if self.model.use_depth_enc and 'sparse_depths' in batch:
-            sparse_depths = batch['sparse_depths'].to(self.device)
-            # Only use sparse depth if it's non-empty
-            if sparse_depths.any():
-                sparse_depth_input = sparse_depths
+        B, S = images.shape[:2]
 
-        outputs = self.model(
-            images,
-            use_ray_pose=self.use_ray_pose,
-            sparse_depth=sparse_depth_input,
+        # Import normalization utilities from MapAnything
+        from uniception.models.encoders.image_normalizations import IMAGE_NORMALIZATION_DICT
+        import torchvision.transforms.v2 as tvf
+
+        # Get dinov2 normalization
+        img_norm_config = IMAGE_NORMALIZATION_DICT['dinov2']
+        img_normalize = tvf.Normalize(mean=img_norm_config.mean, std=img_norm_config.std)
+
+        # Prepare views for MapAnything
+        # MapAnything expects list of dict with 'img' (shape 1,3,H,W) and 'data_norm_type' (string)
+        views = []
+        for b in range(B):
+            for s in range(S):
+                # Convert from (3, H, W) with range [0, 1]
+                img_np = images[b, s]  # (3, H, W) in range [0, 1]
+                H, W = img_np.shape[1], img_np.shape[2]
+
+                # Get original intrinsics before any cropping
+                intr_original = intrinsics[b, s].copy()  # (3, 3)
+
+                # Make sure dimensions are divisible by patch size (14)
+                patch_size = 14
+                H_new = (H // patch_size) * patch_size
+                W_new = (W // patch_size) * patch_size
+
+                # Crop if needed
+                crop_top = (H - H_new) // 2
+                crop_left = (W - W_new) // 2
+
+                if H != H_new or W != W_new:
+                    img_np = img_np[:, crop_top:crop_top+H_new, crop_left:crop_left+W_new]
+
+                # Convert to tensor and normalize
+                img_tensor = torch.from_numpy(img_np).float().to(self.device)  # (3, H, W)
+                img_tensor = img_normalize(img_tensor)  # Apply normalization
+                img_batched = img_tensor.unsqueeze(0)  # (1, 3, H, W)
+
+                view_dict = {
+                    'img': img_batched,
+                    'data_norm_type': ['dinov2'],  # Must be a list!
+                }
+
+                # Add sparse depth if available and non-zero
+                if sparse_depths_batch is not None:
+                    sparse_depth = sparse_depths_batch[b, s]  # Keep as tensor (H, W)
+                    if sparse_depth.dim() == 2:
+                        sparse_depth = sparse_depth.unsqueeze(-1)  # (H, W) -> (H, W, 1)
+
+                    # Crop sparse depth to match cropped image
+                    if sparse_depth.shape[0] != H_new or sparse_depth.shape[1] != W_new:
+                        sparse_depth = sparse_depth[crop_top:crop_top+H_new, crop_left:crop_left+W_new, :]
+
+                    # Always add intrinsics when sparse depth is available (adjusted for crop)
+                    intr_adjusted = intr_original.copy()
+                    intr_adjusted[0, 2] -= crop_left  # principal point x
+                    intr_adjusted[1, 2] -= crop_top   # principal point y
+                    intr_tensor = torch.from_numpy(intr_adjusted).float().to(self.device).unsqueeze(0)  # (1, 3, 3)
+                    view_dict['intrinsics'] = intr_tensor
+
+                    # Only add depth_z and is_metric_scale if sparse depth has non-zero values
+                    # Skip sparse depth input if all zeros to avoid issues in model (MapAnything not trained with all-zero depth input)
+                    if sparse_depth.max() > 0:
+                        # MapAnything internally uses depth_z which gets converted to depth_along_ray
+                        # Shape should be (H, W) or (H, W, 1) for the API
+                        sparse_depth_tensor = sparse_depth.squeeze(-1).float().to(self.device)  # (H, W)
+
+                        # Convert to metric scale before passing to model
+                        # depth_scale_factor is 1/avg_dist, so metric_scale = 1/depth_scale_factor
+                        if depth_scale_factor is not None:
+                            metric_scale = 1.0 / depth_scale_factor.item() if torch.is_tensor(depth_scale_factor) else 1.0 / depth_scale_factor
+                            sparse_depth_tensor = sparse_depth_tensor * metric_scale
+
+                        view_dict['depth_z'] = sparse_depth_tensor
+
+                        # Mark as metric scale (from dataset normalization)
+                        view_dict['is_metric_scale'] = torch.tensor([True], device=self.device)
+
+                views.append(view_dict)
+
+        # Run MapAnything inference
+        print(f"Running MapAnything inference on {len(views)} views...")
+        outputs = self.model.infer(
+            views,
+            memory_efficient_inference=True,
+            minibatch_size=1,
+            use_amp=True,
+            amp_dtype="bf16",
+            apply_mask=False,
+            mask_edges=False,
         )
 
+        # Extract depths and confidences
+        pred_depths = []
+        depth_confs = []
+        pred_intrinsics = []
+        pred_extrinsics = []
+        metric_scaling_factors = []
+
+        for i, output in enumerate(outputs):
+            # Get depth_z from output
+            depth_z = output['depth_z'].cpu().numpy()  # (B, H, W, 1)
+            if depth_z.ndim == 4:  # (B, H, W, 1)
+                depth_z = depth_z[0, :, :, 0]  # (H, W)
+            elif depth_z.ndim == 3:  # (H, W, 1)
+                depth_z = depth_z[:, :, 0]  # (H, W)
+            pred_depths.append(depth_z)
+
+            # Get confidence from output
+            conf = output['conf'].cpu().numpy()  # (B, H, W)
+            if conf.ndim == 3:  # (B, H, W)
+                conf = conf[0]  # (H, W)
+            depth_confs.append(conf)
+
+            # Get intrinsics
+            intr = output['intrinsics'].cpu().numpy()  # (B, 3, 3) or (3, 3)
+            if intr.ndim == 3:  # (B, 3, 3)
+                intr = intr[0]  # (3, 3)
+            pred_intrinsics.append(intr)
+
+            # Get camera poses (c2w format from MapAnything)
+            cam_pose = output['camera_poses'].cpu().numpy()  # (B, 4, 4) or (4, 4)
+            if cam_pose.ndim == 3:  # (B, 4, 4)
+                cam_pose = cam_pose[0]  # (4, 4)
+            pred_extrinsics.append(cam_pose)
+
+            # Get metric scaling factor if available
+            if 'metric_scaling_factor' in output:
+                scale_factor = output['metric_scaling_factor'].cpu().item()
+            else:
+                scale_factor = 1.0
+            metric_scaling_factors.append(scale_factor)
+
+        # Stack into batch format
+        pred_depths = np.stack(pred_depths, axis=0)  # (S, H, W)
+        depth_confs = np.stack(depth_confs, axis=0)  # (S, H, W)
+        pred_intrinsics = np.stack(pred_intrinsics, axis=0)  # (S, 3, 3)
+        pred_extrinsics = np.stack(pred_extrinsics, axis=0)  # (S, 4, 4) - c2w format
+        metric_scaling_factors = np.array(metric_scaling_factors)  # (S,)
+
+        # Convert GT depths to metric scale using depth_scale_factor
+        gt_depths = batch.get('depths', None)
+        sparse_depths_for_output = batch.get('sparse_depths', None)
+
+        if depth_scale_factor is not None:
+            metric_scale = 1.0 / depth_scale_factor.item() if torch.is_tensor(depth_scale_factor) else 1.0 / depth_scale_factor
+
+            if gt_depths is not None:
+                # depth_scale_factor is 1/avg_dist, so we need to invert it to recover metric scale
+                gt_depths = gt_depths * metric_scale
+
+            if sparse_depths_for_output is not None:
+                # Also convert sparse depths to metric scale
+                sparse_depths_for_output = sparse_depths_for_output * metric_scale
+
         return {
-            'pred_depth': outputs['depth'].cpu().numpy()[0],
-            'depth_conf': outputs['depth_conf'].cpu().numpy()[0],
-            'images': batch['images'].cpu().numpy()[0],
-            'extrinsics': batch['extrinsics'].cpu().numpy()[0],
-            'intrinsics': batch['intrinsics'].cpu().numpy()[0],
-            'pred_extrinsics': outputs['extrinsics'].cpu().numpy()[0] if 'extrinsics' in outputs else None,
-            'pred_intrinsics': outputs['intrinsics'].cpu().numpy()[0] if 'intrinsics' in outputs else None,
-            'sparse_depths': batch.get('sparse_depths', torch.zeros_like(batch['images'][:, :1])).cpu().numpy()[0] if 'sparse_depths' in batch else None,
-            'gt_depths': batch.get('depths', torch.zeros_like(batch['images'][:, :1])).cpu().numpy()[0] if 'depths' in batch else None,
+            'pred_depth': pred_depths,
+            'depth_conf': depth_confs,
+            'images': images[0],  # (S, 3, H, W)
+            'extrinsics': extrinsics[0],  # (S, 4, 4) - w2c format (GT)
+            'intrinsics': intrinsics[0],  # (S, 3, 3)
+            'pred_extrinsics': pred_extrinsics,  # (S, 4, 4) - c2w format
+            'pred_extrinsics_is_c2w': True,  # Mark as c2w
+            'pred_intrinsics': pred_intrinsics,
+            'metric_scaling_factors': metric_scaling_factors,  # (S,)
+            'sparse_depths': sparse_depths_for_output.cpu().numpy()[0] if sparse_depths_for_output is not None else None,  # Converted to metric scale
+            'gt_depths': gt_depths,  # GT depths converted to metric scale
         }
 
 
@@ -224,8 +378,6 @@ def main():
         config,
         checkpoint_path=args.checkpoint,
         device=args.device,
-        use_ray_pose=args.use_ray_pose,
-        use_sparse_depth=args.use_sparse_depth,
     )
 
     dataset = visualizer.setup_dataloader(
@@ -297,6 +449,10 @@ def main():
             "Show GT Depth Points",
             initial_value=False,
         )
+        align_scale_to_gt = server.gui.add_checkbox(
+            "Align Pred Scale to GT (using <30m points)",
+            initial_value=False,
+        )
         refresh_button = server.gui.add_button("Refresh")
 
     # Store camera frustum handles for visibility toggle
@@ -310,23 +466,82 @@ def main():
         sample = dataset[current_sample_idx]
         print(f"Running inference on sample {current_sample_idx}...")
 
-        # Update sparse depth ratio if slider exists
-        if args.use_sparse_depth and sparse_depth_ratio_slider is not None:
-            # Regenerate sparse depth with current ratio
-            if 'depths' in sample:
+        # Update sparse depth ratio if sparse depth is enabled
+        if args.use_sparse_depth:
+            if sparse_depth_ratio_slider is not None and 'depths' in sample:
+                # Regenerate sparse depth with current ratio
                 sparse_ratio = sparse_depth_ratio_slider.value
                 sample['sparse_depths'] = torch.stack([
                     dataset._sparsify_depth(d, sparse_ratio) for d in sample['depths']
                 ], dim=0)
                 sample['use_sparse_depth'] = sparse_ratio > 0
+                print(f"Sparse depth ratio: {sparse_ratio}")
 
-        cached_results = visualizer.infer_sample(sample, sparse_depth_ratio=args.sparse_depth_ratio)
+        cached_results = visualizer.infer_sample(sample)
         num_frames = cached_results['pred_depth'].shape[0]
 
         # Update frame selector options
         frame_selector.options = ["All"] + [str(i) for i in range(num_frames)]
 
         print(f"Inference completed for sample {current_sample_idx} ({num_frames} frames)")
+
+    def compute_depth_scale_factor(pred_depths, gt_depths, max_depth_threshold=30.0):
+        """
+        Compute scale factor to align predicted depths to GT depths.
+        Only uses points within max_depth_threshold (default 30m) for robust alignment.
+
+        Args:
+            pred_depths: (S, H, W) predicted depths
+            gt_depths: (B, S, 1, H, W) or (S, H, W) ground truth depths
+            max_depth_threshold: Only use points below this depth (meters)
+
+        Returns:
+            scale_factor: scalar to multiply pred_depths by to align with gt_depths
+        """
+        if gt_depths is None:
+            return 1.0
+
+        # Handle different gt_depths shapes
+        gt_depths_np = gt_depths.cpu().numpy() if torch.is_tensor(gt_depths) else gt_depths
+        if gt_depths_np.ndim == 5:  # (B, S, 1, H, W)
+            gt_depths_np = gt_depths_np[0, :, 0, :, :]  # (S, H, W)
+        elif gt_depths_np.ndim == 4:  # (B, S, H, W)
+            gt_depths_np = gt_depths_np[0, :, :, :]  # (S, H, W)
+
+        # Collect all valid points within depth threshold
+        valid_pred = []
+        valid_gt = []
+
+        for s in range(pred_depths.shape[0]):
+            pred = pred_depths[s]
+            gt = gt_depths_np[s]
+
+            # Find pixels where both pred and gt are valid and within threshold
+            valid_mask = (gt > 0) & (gt < max_depth_threshold)
+
+            if valid_mask.sum() > 0:
+                valid_pred.append(pred[valid_mask])
+                valid_gt.append(gt[valid_mask])
+
+        if len(valid_pred) == 0:
+            return 1.0
+
+        # Concatenate all valid points
+        all_pred = np.concatenate(valid_pred)
+        all_gt = np.concatenate(valid_gt)
+
+        # Compute median or mean scale factor
+        # scale_factor = mean(gt) / mean(pred)
+        mean_gt = np.mean(all_gt)
+        mean_pred = np.mean(all_pred)
+
+        if mean_pred > 0:
+            scale_factor = mean_gt / mean_pred
+        else:
+            scale_factor = 1.0
+
+        print(f"Scale alignment: pred_mean={mean_pred:.3f}, gt_mean={mean_gt:.3f}, scale_factor={scale_factor:.3f}")
+        return scale_factor
 
     def update_visualization():
         """Update the 3D visualization using cached results."""
@@ -351,15 +566,24 @@ def main():
         pred_depth = cached_results['pred_depth']
         depth_conf = cached_results['depth_conf']
         images = cached_results['images']
+        metric_scaling_factors = cached_results.get('metric_scaling_factors', np.ones(pred_depth.shape[0]))
+
+        # Apply scale alignment if enabled
+        if align_scale_to_gt.value and cached_results.get('gt_depths') is not None:
+            scale_factor = compute_depth_scale_factor(pred_depth, cached_results['gt_depths'])
+            pred_depth = pred_depth * scale_factor
+            print(f"Applied scale alignment: pred_depth *= {scale_factor:.3f}")
 
         # Use predicted camera parameters (model output)
         pred_extrinsics = cached_results['pred_extrinsics']
         pred_intrinsics = cached_results['pred_intrinsics']
+        pred_extrinsics_is_c2w = cached_results.get('pred_extrinsics_is_c2w', False)
 
         # Fallback to GT if prediction not available
         if pred_extrinsics is None:
             print("Warning: pred_extrinsics not available, using GT")
             pred_extrinsics = cached_results['extrinsics']
+            pred_extrinsics_is_c2w = False  # GT is w2c
         if pred_intrinsics is None:
             print("Warning: pred_intrinsics not available, using GT")
             pred_intrinsics = cached_results['intrinsics']
@@ -420,7 +644,11 @@ def main():
             )
 
             if len(pred_points) > 0:
-                pred_points_world = transform_points(pred_points, extrinsics[s])
+                pred_points_world = transform_points(
+                    pred_points,
+                    extrinsics[s],
+                    is_c2w=pred_extrinsics_is_c2w
+                )
                 pred_colors = img_resized[pred_pixel_coords[:, 0], pred_pixel_coords[:, 1]]
 
                 server.scene.add_point_cloud(
@@ -433,11 +661,13 @@ def main():
 
             # Add camera visualization using predicted extrinsics
             if show_cameras.value:
-                c2w = np.linalg.inv(extrinsics[s])
-                R = c2w[:3, :3]
-                t = c2w[:3, 3]
+                if pred_extrinsics_is_c2w:
+                    # extrinsics is c2w, use directly
+                    c2w = extrinsics[s]
+                else:
+                    # extrinsics is w2c, invert it
+                    c2w = np.linalg.inv(extrinsics[s])
 
-                # Convert to SE3 for viser
                 c2w_3x4 = c2w[:3, :]
                 T_world_camera = viser_tf.SE3.from_matrix(c2w_3x4)
 
@@ -487,7 +717,7 @@ def main():
                     )
 
                     if len(sparse_points) > 0:
-                        sparse_points_world = transform_points(sparse_points, extrinsics[s])
+                        sparse_points_world = transform_points(sparse_points, extrinsics[s], is_c2w=pred_extrinsics_is_c2w)
                         sparse_colors = img_resized[sparse_pixel_coords[:, 0], sparse_pixel_coords[:, 1]]
 
                         server.scene.add_point_cloud(
@@ -501,11 +731,12 @@ def main():
             # Visualize GT depth if available and enabled
             if (show_gt_depth.value and
                 cached_results['gt_depths'] is not None):
-                gt_depth = cached_results['gt_depths'][s]
-                if gt_depth.shape[0] == 1:  # [1, H, W] -> [H, W]
+                gt_depths = cached_results['gt_depths'].cpu().numpy() if torch.is_tensor(cached_results['gt_depths']) else cached_results['gt_depths']
+                gt_depth = gt_depths[0, s]  # (B, S, 1, H, W) -> (H, W)
+                if gt_depth.shape[0] == 1:
                     gt_depth = gt_depth[0]
 
-                # Convert GT depth to 3D points
+                # Convert GT depth to 3D points (GT is already in metric scale)
                 if gt_depth.max() > 0:
                     gt_points, gt_pixel_coords = depth_to_points_with_conf(
                         gt_depth,
@@ -517,7 +748,8 @@ def main():
                     )
 
                     if len(gt_points) > 0:
-                        gt_points_world = transform_points(gt_points, extrinsics[s])
+                        # GT uses w2c format
+                        gt_points_world = transform_points(gt_points, extrinsics[s], is_c2w=False)
                         # Color GT points with pure red (255, 0, 0)
                         gt_colors = np.tile(np.array([255, 0, 0], dtype=np.uint8), (len(gt_points), 1))
 
@@ -588,6 +820,10 @@ def main():
             update_visualization()
 
     @show_gt_depth.on_update
+    def _(_):
+        update_visualization()
+
+    @align_scale_to_gt.on_update
     def _(_):
         update_visualization()
 

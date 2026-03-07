@@ -23,6 +23,7 @@ from .dinov2 import DinoV2
 from .dualdpt import DualDPT
 from .cam_dec import CameraDec
 from .cam_enc import CameraEnc
+from .sparse_depth_enc import SparseDepthEnc
 from .utils.transform import pose_encoding_to_extri_intri
 from .utils.geometry import affine_inverse, as_homogeneous
 from .utils.ray_utils import get_extrinsic_from_camray
@@ -52,6 +53,7 @@ class DepthAnything3Net(nn.Module):
         cat_token: bool = True,
         predict_camera: bool = True,
         use_camera_enc: bool = False,
+        use_depth_enc: bool = False,
     ):
         """Initialize Depth Anything 3 network.
 
@@ -66,12 +68,14 @@ class DepthAnything3Net(nn.Module):
             cat_token: Whether to concatenate tokens
             predict_camera: Whether to predict camera pose
             use_camera_enc: Whether to use camera encoder (requires GT camera poses)
+            use_depth_enc: Whether to use depth encoder for optional sparse depth input
         """
         super().__init__()
 
         self.encoder_name = encoder_name
         self.predict_camera = predict_camera
         self.use_camera_enc = use_camera_enc
+        self.use_depth_enc = use_depth_enc
 
         # Encoder dimensions
         encoder_dims = {
@@ -114,11 +118,21 @@ class DepthAnything3Net(nn.Module):
         else:
             self.cam_enc = None
 
+        # Initialize depth encoder (optional, for sparse depth input)
+        if use_depth_enc:
+            self.depth_enc = SparseDepthEnc(embed_dim=self.embed_dim, patch_size=14)
+            # depth_fusion_norm will be initialized per-layer based on actual C_feat
+            self.depth_fusion_norm = None
+        else:
+            self.depth_enc = None
+            self.depth_fusion_norm = None
+
     def forward(
         self,
         x: torch.Tensor,
         extrinsics: Optional[torch.Tensor] = None,
         intrinsics: Optional[torch.Tensor] = None,
+        sparse_depth: Optional[torch.Tensor] = None,
         export_feat_layers: List[int] = [],
         use_ray_pose: bool = False,
     ) -> AdDict:
@@ -128,6 +142,7 @@ class DepthAnything3Net(nn.Module):
             x: Input images of shape [B, S, 3, H, W]
             extrinsics: Camera extrinsics [B, S, 4, 4] (optional, for camera encoder)
             intrinsics: Camera intrinsics [B, S, 3, 3] (optional, for camera encoder)
+            sparse_depth: Sparse depth map [B, S, H, W] (optional, for depth encoder)
             export_feat_layers: List of layer indices to extract features from
             use_ray_pose: If True, use ray-based pose estimation instead of CameraDec
 
@@ -152,6 +167,11 @@ class DepthAnything3Net(nn.Module):
             x, cam_token=cam_token, export_feat_layers=export_feat_layers
         )
 
+        # Fuse sparse depth features if provided
+        if sparse_depth is not None and self.depth_enc is not None:
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                feats = self._fuse_depth_features(feats, sparse_depth, x.shape[0], x.shape[1])
+
         H, W = x.shape[-2], x.shape[-1]
 
         # Process features through heads
@@ -173,6 +193,72 @@ class DepthAnything3Net(nn.Module):
     ) -> AdDict:
         """Process features through the depth prediction head."""
         return self.head(feats, H, W, patch_start_idx=0)
+
+    def _fuse_depth_features(
+        self, feats: List[torch.Tensor], sparse_depth: torch.Tensor, B: int, S: int
+    ) -> List[torch.Tensor]:
+        """Fuse sparse depth features into backbone features via additive fusion.
+
+        Args:
+            feats: List of 4 features from backbone.get_intermediate_layers()
+                   Each element is a tuple: (patch_tokens, cls_token)
+                   where patch_tokens is [B, S, N, C] and cls_token is [B, S, C]
+            sparse_depth: [B, S, H, W] sparse depth map
+            B: Batch size
+            S: Number of views
+
+        Returns:
+            feats: Updated features with depth fusion applied to all 4 layers
+        """
+        # Encode sparse depth
+        # Reshape sparse_depth to [B*S, 1, H, W] for depth encoder
+        depth_feats = self.depth_enc(sparse_depth)  # [B*S, embed_dim, H/14, W/14]
+
+        # Reshape depth_feats to [B, S, N, embed_dim] to match feats format
+        B_S, C_depth, H_p, W_p = depth_feats.shape
+        N_depth = H_p * W_p
+        depth_feats_reshaped = depth_feats.reshape(B, S, C_depth, N_depth).permute(0, 1, 3, 2).contiguous()
+        # Now depth_feats_reshaped is [B, S, N_depth, embed_dim]
+
+        # Fuse depth features to all 4 extracted layers
+        fused_feats = []
+        for layer_idx, (patch_tokens, cls_token) in enumerate(feats):
+            # patch_tokens: [B, S, N, C] where C can be 2*embed_dim (if cat_token) or embed_dim
+            B_feat, S_feat, N_feat, C_feat = patch_tokens.shape
+
+            # Ensure N matches between patch_tokens and depth_feats
+            if N_feat != N_depth:
+                # Reshape depth features to match patch token dimensions
+                # This shouldn't happen if patches are uniform, but let's be safe
+                depth_feat_expanded = torch.nn.functional.interpolate(
+                    depth_feats.reshape(B * S, C_depth, H_p, W_p),
+                    size=(int((N_feat) ** 0.5), int((N_feat) ** 0.5)),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                depth_feat_expanded = depth_feat_expanded.reshape(B, S, C_depth, N_feat).permute(0, 1, 3, 2).contiguous()
+            else:
+                depth_feat_expanded = depth_feats_reshaped
+
+            if C_feat == self.embed_dim:
+                # No cat_token, direct addition
+                pass
+            elif C_feat == self.embed_dim * 2:
+                # cat_token=True, expand depth features to match doubled dimension
+                # by repeating along the channel dimension
+                depth_feat_expanded = depth_feat_expanded.repeat(1, 1, 1, 2)
+            else:
+                raise ValueError(f"Unexpected patch_tokens dimension: {C_feat}")
+
+            # Add depth features
+            fused_patch_tokens = patch_tokens + depth_feat_expanded
+
+            # Apply LayerNorm after fusion - no need to normalize,
+            # as the feature dimensions are already learned
+
+            fused_feats.append((fused_patch_tokens, cls_token))
+
+        return fused_feats
 
     def _process_camera_estimation(
         self, feats: List[torch.Tensor], H: int, W: int, output: AdDict

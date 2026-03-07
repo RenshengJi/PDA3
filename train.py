@@ -123,6 +123,7 @@ class Trainer:
     def setup_model(self):
         """Setup model."""
         model_config = self.config.get('model', {})
+        sparse_depth_config = self.config.get('sparse_depth', {})
 
         self.model = DepthAnything3Net(
             encoder_name=model_config.get('encoder_name', 'vitl'),
@@ -135,6 +136,8 @@ class Trainer:
             predict_camera=model_config.get('predict_camera', True),
             # Enable camera encoder for camera input
             use_camera_enc=model_config.get('use_camera_enc', True),
+            # Enable depth encoder if sparse depth is enabled
+            use_depth_enc=sparse_depth_config.get('enabled', False),
         )
 
         # Load pretrained weights
@@ -204,6 +207,7 @@ class Trainer:
     def setup_data(self):
         """Setup data loaders."""
         data_config = self.config.get('data', {})
+        sparse_depth_config = self.config.get('sparse_depth', {})
 
         # Training dataset
         train_dataset = WaymoDataset(
@@ -213,6 +217,9 @@ class Trainer:
             num_views=data_config.get('num_views', 4),
             resolution=data_config.get('resolution', 518),
             split='train',
+            sparse_depth_prob=sparse_depth_config.get('input_prob', 0.0),
+            sparse_depth_keep_ratio=sparse_depth_config.get('keep_ratio', 0.1),
+            sparse_depth_keep_ratio_range=sparse_depth_config.get('keep_ratio_range'),
         )
 
         if self.distributed:
@@ -242,6 +249,8 @@ class Trainer:
                 num_views=data_config.get('num_views', 4),
                 resolution=data_config.get('resolution', 518),
                 split='val',
+                sparse_depth_prob=sparse_depth_config.get('input_prob', 0.0),
+                sparse_depth_keep_ratio=sparse_depth_config.get('keep_ratio', 0.1),
             )
             self.val_loader = DataLoader(
                 val_dataset,
@@ -384,17 +393,19 @@ class Trainer:
 
             # Camera input: pass extrinsics and intrinsics to model
             # Based on DA3 paper Section 3.2: Input-adaptive camera conditioning
-            # With probability camera_dropout_prob, don't provide camera input 
+            # With probability camera_dropout_prob, don't provide camera input
             use_camera_cond = self.use_camera_input and torch.rand(1).item() > self.camera_dropout_prob
 
-            if use_camera_cond and 'extrinsics' in batch and 'intrinsics' in batch:
-                outputs = model(
-                    batch['images'],
-                    extrinsics=batch['extrinsics'],
-                    intrinsics=batch['intrinsics'],
-                )
-            else:
-                outputs = model(batch['images'])
+            # Build sparse depth input if available
+            sparse_depth_input = batch.get('sparse_depths') if batch.get('use_sparse_depth', False) else None
+
+            # Forward pass (conditional camera input via ternary operators)
+            outputs = model(
+                batch['images'],
+                extrinsics=batch['extrinsics'] if (use_camera_cond and 'extrinsics' in batch) else None,
+                intrinsics=batch['intrinsics'] if (use_camera_cond and 'intrinsics' in batch) else None,
+                sparse_depth=sparse_depth_input,
+            )
 
             # Get teacher predictions if needed
             teacher_depth = None
