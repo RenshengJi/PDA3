@@ -1078,8 +1078,8 @@ class DA3Loss(nn.Module):
 
             # Prepare preds dict with model outputs
             preds = {
-                'gaussian_params': outputs['gaussian_params'],
-                'xyz_camera': outputs.get('xyz_camera', torch.zeros(1, 1, 1, 3, device=outputs['gaussian_params'].device)),
+                'gaussians': outputs.get('gaussians'),
+                'gaussian_params': outputs.get('gaussian_params'),
                 'extrinsics': batch['extrinsics'],
                 'intrinsics': batch['intrinsics'],
             }
@@ -1137,12 +1137,21 @@ def self_render_and_loss(
     point_masks = vggt_batch.get("point_masks")  # [B, S, H, W]
 
     # Get Gaussians from adapter output (already processed)
-    gaussians = preds["gaussians"]
-    # gaussians.means: [B, S*H*W, 3]
-    # gaussians.scales: [B, S*H*W, 3]
-    # gaussians.rotations: [B, S*H*W, 4] (wxyz)
-    # gaussians.harmonics: [B, S*H*W, 3, d_sh]
-    # gaussians.opacities: [B, S*H*W] (already sigmoid activated)
+    gaussians = preds.get("gaussians")
+    if gaussians is None:
+        # Return empty loss dict if gaussians not available
+        empty_loss = {
+            "loss_self_render_rgb": torch.tensor(0.0, device=gt_rgb.device),
+            "loss_self_render_lpips": torch.tensor(0.0, device=gt_rgb.device),
+            "loss_self_render_depth": torch.tensor(0.0, device=gt_rgb.device),
+        }
+        empty_img = {
+            "self_rgb_pred": torch.zeros_like(gt_rgb[0]),
+            "self_rgb_gt": torch.zeros_like(gt_rgb[0]),
+            "self_depth_pred": torch.zeros_like(gt_depths[0]).unsqueeze(1),
+            "self_depth_gt": torch.zeros_like(gt_depths[0]).unsqueeze(1),
+        }
+        return empty_loss, empty_img
 
     B, S, _, image_height, image_width = gt_rgb.shape
 

@@ -17,7 +17,7 @@ model:
   qknorm_start: 13
   rope_start: 13
   predict_camera: true
-  use_camera_enc: true
+  use_camera_enc: false
   # Enable Gaussian head
   predict_gaussians: true
   gaussian_sh_degree: 2

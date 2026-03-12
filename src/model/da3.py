@@ -394,8 +394,8 @@ class DepthAnything3Net(nn.Module):
             H: Image height
             W: Image width
             output: Output dictionary with depth and pose estimates
-            extrinsics: Camera extrinsics (optional, for adapter)
-            intrinsics: Camera intrinsics (optional, for camera encoder)
+            extrinsics: Camera extrinsics (optional, uses output.extrinsics if None)
+            intrinsics: Camera intrinsics (optional, uses output.intrinsics if None)
 
         Returns:
             Updated output dictionary with Gaussian parameters
@@ -421,7 +421,7 @@ class DepthAnything3Net(nn.Module):
         )  # [B, S, param_dim, H, W]
         gaussian_params_reshaped = gaussian_params_reshaped.permute(0, 1, 3, 4, 2)  # [B, S, H, W, param_dim]
 
-        # Use GT extrinsics/intrinsics if available, otherwise use predicted ones
+        # Use provided extrinsics/intrinsics, or fall back to output predictions
         if extrinsics is None:
             extrinsics = output.get("extrinsics", None)
         if intrinsics is None:
@@ -441,6 +441,10 @@ class DepthAnything3Net(nn.Module):
 
             # Store Gaussian outputs
             output.gaussians = gaussians
+            output.gaussian_params = gs_params_raw["raw_gs"]
+        else:
+            # Extrinsics/intrinsics not available, set gaussians to None
+            output.gaussians = None
             output.gaussian_params = gs_params_raw["raw_gs"]
 
         return output
