@@ -138,6 +138,10 @@ class Trainer:
             use_camera_enc=model_config.get('use_camera_enc', True),
             # Enable depth encoder if sparse depth is enabled
             use_depth_enc=sparse_depth_config.get('enabled', False),
+            # Enable Gaussian head if specified
+            predict_gaussians=model_config.get('predict_gaussians', False),
+            gaussian_sh_degree=model_config.get('gaussian_sh_degree', 0),
+            gaussian_output_dim=model_config.get('gaussian_output_dim', None),
         )
 
         # Load pretrained weights
@@ -300,6 +304,15 @@ class Trainer:
             # Teacher settings (per paper: switch at 120k out of 200k steps)
             use_teacher=loss_config.get('use_teacher', False),
             switch_to_teacher_step=loss_config.get('switch_to_teacher_step', 120000),
+            # Self-render loss for Gaussian head
+            use_self_render=loss_config.get('use_self_render', False),
+            self_render_weight=loss_config.get('self_render_weight', 1.0),
+            self_render_rgb_weight=loss_config.get('self_render_rgb_weight', 1.0),
+            self_render_lpips_weight=loss_config.get('self_render_lpips_weight', 0.1),
+            self_render_depth_weight=loss_config.get('self_render_depth_weight', 0.5),
+            gaussian_sh_degree=loss_config.get('gaussian_sh_degree', 0),
+            enable_voxel_pruning=loss_config.get('enable_voxel_pruning', False),
+            voxel_size=loss_config.get('voxel_size', 0.002),
         )
 
         if self.rank == 0:
@@ -310,28 +323,97 @@ class Trainer:
             print(f"  - Point loss: {loss_config.get('use_point', True)}")
             print(f"  - Camera loss: {loss_config.get('use_camera', True)}")
             print(f"  - Teacher: {loss_config.get('use_teacher', False)} (switch at step {loss_config.get('switch_to_teacher_step', 120000)})")
+            print(f"  - Self-render loss: {loss_config.get('use_self_render', False)}")
 
     def setup_optimizer(self):
         """Setup optimizer and scheduler."""
         optim_config = self.config.get('optimizer', {})
+        training_config = self.config.get('training', {})
 
         # Get model parameters
         model = self.model.module if self.distributed else self.model
 
-        # Separate encoder and decoder parameters
+        # Check if we're doing gaussian head only training
+        freeze_backbone = training_config.get('freeze_backbone', False)
+        freeze_depth_head = training_config.get('freeze_depth_head', False)
+        freeze_camera_head = training_config.get('freeze_camera_head', False)
+        freeze_depth_encoder = training_config.get('freeze_depth_encoder', False)
+        freeze_camera_encoder = training_config.get('freeze_camera_encoder', False)
+
+        # Freeze parameters if requested
+        if freeze_backbone:
+            for name, param in model.named_parameters():
+                if 'backbone' in name:
+                    param.requires_grad = False
+                    print(f"Freezing: {name}")
+
+        if freeze_depth_head:
+            for name, param in model.named_parameters():
+                if 'head' in name and 'gs_head' not in name:
+                    param.requires_grad = False
+                    print(f"Freezing: {name}")
+
+        if freeze_camera_head:
+            for name, param in model.named_parameters():
+                if 'cam_dec' in name:
+                    param.requires_grad = False
+                    print(f"Freezing: {name}")
+
+        if freeze_depth_encoder:
+            for name, param in model.named_parameters():
+                if 'depth_enc' in name:
+                    param.requires_grad = False
+                    print(f"Freezing: {name}")
+
+        if freeze_camera_encoder:
+            for name, param in model.named_parameters():
+                if 'cam_enc' in name:
+                    param.requires_grad = False
+                    print(f"Freezing: {name}")
+
+        # Separate parameters by type
         encoder_params = []
         decoder_params = []
+        gaussian_params = []
+
         for name, param in model.named_parameters():
-            if 'backbone' in name or 'encoder' in name:
+            if not param.requires_grad:
+                continue
+
+            if 'gs_head' in name or 'gs_adapter' in name:
+                gaussian_params.append(param)
+            elif 'backbone' in name or 'encoder' in name:
                 encoder_params.append(param)
             else:
                 decoder_params.append(param)
 
-        # Different learning rates for encoder and decoder
-        param_groups = [
-            {'params': encoder_params, 'lr': optim_config.get('encoder_lr', 1e-6)},
-            {'params': decoder_params, 'lr': optim_config.get('decoder_lr', 1e-4)},
-        ]
+        # Build parameter groups with appropriate learning rates
+        param_groups = []
+
+        if gaussian_params:
+            param_groups.append({
+                'params': gaussian_params,
+                'lr': optim_config.get('gaussian_head_lr', optim_config.get('decoder_lr', 1e-4))
+            })
+            print(f"Gaussian head parameters: {len(gaussian_params)}")
+
+        if encoder_params:
+            param_groups.append({
+                'params': encoder_params,
+                'lr': optim_config.get('encoder_lr', 1e-6)
+            })
+            print(f"Encoder parameters: {len(encoder_params)}")
+
+        if decoder_params:
+            param_groups.append({
+                'params': decoder_params,
+                'lr': optim_config.get('decoder_lr', 1e-4)
+            })
+            print(f"Decoder parameters: {len(decoder_params)}")
+
+        if not param_groups:
+            print("Warning: No trainable parameters found!")
+            return
 
         self.optimizer = optim.AdamW(
             param_groups,
@@ -574,7 +656,7 @@ def main():
     # debug
     if args.debug:
         import debugpy
-        debugpy.listen(5678)
+        debugpy.listen(5679)
         print("Waiting for debugger attach...")
         debugpy.wait_for_client()
         print("Debugger attached.")

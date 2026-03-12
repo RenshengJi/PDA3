@@ -24,6 +24,8 @@ from .dualdpt import DualDPT
 from .cam_dec import CameraDec
 from .cam_enc import CameraEnc
 from .sparse_depth_enc import SparseDepthEnc
+from .gs_adapter import GaussianAdapter
+from .gsdpt import GSDPT
 from .utils.transform import pose_encoding_to_extri_intri
 from .utils.geometry import affine_inverse, as_homogeneous
 from .utils.ray_utils import get_extrinsic_from_camray
@@ -54,6 +56,9 @@ class DepthAnything3Net(nn.Module):
         predict_camera: bool = True,
         use_camera_enc: bool = False,
         use_depth_enc: bool = False,
+        predict_gaussians: bool = False,
+        gaussian_sh_degree: int = 0,
+        gaussian_output_dim: int = None,
     ):
         """Initialize Depth Anything 3 network.
 
@@ -69,6 +74,9 @@ class DepthAnything3Net(nn.Module):
             predict_camera: Whether to predict camera pose
             use_camera_enc: Whether to use camera encoder (requires GT camera poses)
             use_depth_enc: Whether to use depth encoder for optional sparse depth input
+            predict_gaussians: Whether to predict Gaussian Splatting parameters
+            gaussian_sh_degree: Spherical harmonics degree for Gaussian Splatting
+            gaussian_output_dim: Output dimension for Gaussian head (auto-calculated if None)
         """
         super().__init__()
 
@@ -76,6 +84,9 @@ class DepthAnything3Net(nn.Module):
         self.predict_camera = predict_camera
         self.use_camera_enc = use_camera_enc
         self.use_depth_enc = use_depth_enc
+        self.predict_gaussians = predict_gaussians
+        self.gaussian_sh_degree = gaussian_sh_degree
+        self.gaussian_output_dim = gaussian_output_dim
 
         # Encoder dimensions
         encoder_dims = {
@@ -126,6 +137,29 @@ class DepthAnything3Net(nn.Module):
         else:
             self.depth_enc = None
             self.depth_fusion_norm = None
+
+        # Initialize Gaussian Splatting head (optional, for 3D Gaussian rendering)
+        if predict_gaussians:
+            self.gs_adapter = GaussianAdapter(
+                sh_degree=gaussian_sh_degree,
+                pred_color=False,
+                pred_offset_depth=True,
+                pred_offset_xy=True,
+            )
+            # Calculate output dimension for Gaussian parameters
+            # output_dim = d_in (raw params) + 1 (confidence/opacity from GSDPT head)
+            if gaussian_output_dim is None:
+                gaussian_output_dim = self.gs_adapter.d_in + 1
+            self.gs_head = GSDPT(
+                dim_in=self.in_channels,
+                output_dim=gaussian_output_dim,
+                features=features,
+                out_channels=out_channels,
+                pos_embed=True,
+            )
+        else:
+            self.gs_head = None
+            self.gs_adapter = None
 
     def forward(
         self,
@@ -182,6 +216,10 @@ class DepthAnything3Net(nn.Module):
                 output = self._process_ray_pose_estimation(output, H, W)
             else:
                 output = self._process_camera_estimation(feats, H, W, output)
+
+            # Process Gaussian head if enabled
+            if self.predict_gaussians:
+                output = self._process_gaussian_head(feats, x, H, W, output, extrinsics, intrinsics)
 
         # Extract auxiliary features if requested
         output.aux = self._extract_auxiliary_features(aux_feats, export_feat_layers, H, W)
@@ -337,6 +375,75 @@ class DepthAnything3Net(nn.Module):
             aux_features[f"feat_layer_{feat_layer}"] = feat_reshaped
 
         return aux_features
+
+    def _process_gaussian_head(
+        self,
+        feats: List[torch.Tensor],
+        images: torch.Tensor,
+        H: int,
+        W: int,
+        output: AdDict,
+        extrinsics: Optional[torch.Tensor] = None,
+        intrinsics: Optional[torch.Tensor] = None,
+    ) -> AdDict:
+        """Process features through Gaussian head for 3D Gaussian Splatting.
+
+        Args:
+            feats: Backbone features
+            images: Input images [B, S, 3, H, W]
+            H: Image height
+            W: Image width
+            output: Output dictionary with depth and pose estimates
+            extrinsics: Camera extrinsics (optional, for adapter)
+            intrinsics: Camera intrinsics (optional, for camera encoder)
+
+        Returns:
+            Updated output dictionary with Gaussian parameters
+        """
+        if self.gs_head is None or self.gs_adapter is None:
+            return output
+
+        B, S = images.shape[:2]
+
+        # Process features through Gaussian head
+        gs_params_raw = self.gs_head(feats, H, W, patch_start_idx=0, images=images)
+
+        # Get depths from depth head output
+        depths = output.depth  # [B, S, H, W]
+
+        # Get opacity from gs_head conf output (already sigmoid activated)
+        opacities_raw = gs_params_raw["raw_gs_conf"]  # [B*S, H, W]
+        opacities = opacities_raw.reshape(B, S, H, W)  # [B, S, H, W]
+
+        # Reshape gaussian parameters for adapter
+        gaussian_params_reshaped = gs_params_raw["raw_gs"].reshape(
+            B, S, -1, H, W
+        )  # [B, S, param_dim, H, W]
+        gaussian_params_reshaped = gaussian_params_reshaped.permute(0, 1, 3, 4, 2)  # [B, S, H, W, param_dim]
+
+        # Use GT extrinsics/intrinsics if available, otherwise use predicted ones
+        if extrinsics is None:
+            extrinsics = output.get("extrinsics", None)
+        if intrinsics is None:
+            intrinsics = output.get("intrinsics", None)
+
+        # Process through Gaussian adapter
+        if extrinsics is not None and intrinsics is not None:
+            gaussians = self.gs_adapter(
+                extrinsics=extrinsics,
+                intrinsics=intrinsics,
+                depths=depths,
+                opacities=opacities,  # [B, S, H, W]
+                raw_gaussians=gaussian_params_reshaped,  # [B, S, H, W, param_dim]
+                image_shape=(H, W),
+                gt_extrinsics=extrinsics,  # Use for alignment if needed
+            )
+
+            # Store Gaussian outputs
+            output.gaussians = gaussians
+            output.gaussian_params = gs_params_raw["raw_gs"]
+
+        return output
 
     def load_pretrained(self, checkpoint_path: str, strict: bool = False):
         """Load pretrained weights.

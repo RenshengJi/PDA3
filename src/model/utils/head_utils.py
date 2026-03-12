@@ -119,3 +119,57 @@ def custom_interpolate(
         return torch.cat(outs, dim=0).contiguous()
 
     return nn.functional.interpolate(x, size=size, mode=mode, align_corners=align_corners)
+
+
+def activate_head_gs(out, activation="norm_exp", conf_activation="expp1", conf_dim=None):
+    """
+    Process network output to extract GS params and density values.
+    Density could be view-dependent as SH coefficient
+
+    Args:
+        out: Network output tensor (B, C, H, W)
+        activation: Activation type for 3D points
+        conf_activation: Activation type for confidence values
+        conf_dim: Number of confidence dimensions
+
+    Returns:
+        Tuple of (3D points tensor, confidence tensor)
+    """
+    # Move channels from last dim to the 4th dimension => (B, H, W, C)
+    fmap = out.permute(0, 2, 3, 1)  # B,H,W,C expected
+
+    # Split into xyz (first C-1 channels) and confidence (last channel)
+    conf_dim = 1 if conf_dim is None else conf_dim
+    xyz = fmap[:, :, :, :-conf_dim]
+    conf = fmap[:, :, :, -1] if conf_dim == 1 else fmap[:, :, :, -conf_dim:]
+
+    if activation == "norm_exp":
+        d = xyz.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        xyz_normed = xyz / d
+        pts3d = xyz_normed * torch.expm1(d)
+    elif activation == "norm":
+        pts3d = xyz / xyz.norm(dim=-1, keepdim=True)
+    elif activation == "exp":
+        pts3d = torch.exp(xyz)
+    elif activation == "relu":
+        pts3d = F.relu(xyz)
+    elif activation == "sigmoid":
+        pts3d = torch.sigmoid(xyz)
+    elif activation == "linear":
+        pts3d = xyz
+    else:
+        raise ValueError(f"Unknown activation: {activation}")
+
+    if conf_activation == "expp1":
+        conf_out = 1 + conf.exp()
+    elif conf_activation == "expp0":
+        conf_out = conf.exp()
+    elif conf_activation == "sigmoid":
+        conf_out = torch.sigmoid(conf)
+    elif conf_activation == "linear":
+        conf_out = conf
+    else:
+        raise ValueError(f"Unknown conf_activation: {conf_activation}")
+
+    return pts3d, conf_out
+

@@ -23,6 +23,8 @@ from math import ceil, floor
 
 from src.model.utils.transform import extri_intri_to_pose_encoding
 from src.model.utils.ray_utils import get_extrinsic_from_camray
+from gsplat.rendering import rasterization
+from src.utils import compute_lpips
 
 
 def check_and_fix_inf_nan(loss_tensor, loss_name, hard_max=100):
@@ -856,6 +858,15 @@ class DA3Loss(nn.Module):
         # Teacher settings
         use_teacher=False,
         switch_to_teacher_step=120000,
+        # Self-render loss for Gaussian head
+        use_self_render=False,
+        self_render_weight=1.0,
+        self_render_rgb_weight=1.0,
+        self_render_lpips_weight=0.1,
+        self_render_depth_weight=0.5,
+        gaussian_sh_degree=0,
+        enable_voxel_pruning=False,
+        voxel_size=0.002,
     ):
         super().__init__()
 
@@ -890,6 +901,16 @@ class DA3Loss(nn.Module):
 
         self.use_teacher = use_teacher
         self.switch_to_teacher_step = switch_to_teacher_step
+
+        # Self-render loss for Gaussian head
+        self.use_self_render = use_self_render
+        self.self_render_weight = self_render_weight
+        self.self_render_rgb_weight = self_render_rgb_weight
+        self.self_render_lpips_weight = self_render_lpips_weight
+        self.self_render_depth_weight = self_render_depth_weight
+        self.gaussian_sh_degree = gaussian_sh_degree
+        self.enable_voxel_pruning = enable_voxel_pruning
+        self.voxel_size = voxel_size
 
     def forward(
         self,
@@ -1046,6 +1067,162 @@ class DA3Loss(nn.Module):
             total_loss = total_loss + self.camera_weight * camera_loss_dict['loss_camera']
             loss_dict.update(camera_loss_dict)
 
+        # 5. Self-render loss for Gaussian head (L_GS)
+        if self.use_self_render and 'gaussian_params' in outputs:
+            # Prepare vggt_batch with GT data
+            vggt_batch = {
+                'images': batch['images'],  # (B, S, 3, H, W)
+                'depths': batch['depths'],  # (B, S, H, W)
+                'point_masks': batch.get('point_masks', torch.ones_like(batch['depths'])),
+            }
+
+            # Prepare preds dict with model outputs
+            preds = {
+                'gaussian_params': outputs['gaussian_params'],
+                'xyz_camera': outputs.get('xyz_camera', torch.zeros(1, 1, 1, 3, device=outputs['gaussian_params'].device)),
+                'extrinsics': batch['extrinsics'],
+                'intrinsics': batch['intrinsics'],
+            }
+
+            # Compute self-render loss
+            self_render_loss_dict, _ = self_render_and_loss(
+                vggt_batch,
+                preds,
+                sh_degree=self.gaussian_sh_degree,
+                enable_voxel_pruning=self.enable_voxel_pruning,
+                voxel_size=self.voxel_size,
+            )
+
+            # Combine self-render losses with weights
+            gs_loss = (
+                self.self_render_rgb_weight * self_render_loss_dict.get('loss_self_render_rgb', 0) +
+                self.self_render_lpips_weight * self_render_loss_dict.get('loss_self_render_lpips', 0) +
+                self.self_render_depth_weight * self_render_loss_dict.get('loss_self_render_depth', 0)
+            )
+
+            total_loss = total_loss + self.self_render_weight * gs_loss
+            loss_dict.update(self_render_loss_dict)
+            loss_dict['loss_gaussian'] = gs_loss
+
         loss_dict['total_loss'] = total_loss
 
-        return loss_dict
+
+
+
+def self_render_and_loss(
+    vggt_batch,
+    preds,
+    sampled_frame_indices=None,
+    sh_degree=0,
+    enable_voxel_pruning=False,
+    voxel_size=0.002,
+):
+    """
+    Self-rendering loss: each frame renders and supervises itself.
+
+    Args:
+        vggt_batch: dict containing GT data including images, depths, point_masks
+        preds: dict containing model predictions including gaussians, extrinsics, intrinsics
+        sampled_frame_indices: list of frame indices to render (optional, renders all frames if None)
+        sh_degree: int, spherical harmonics degree
+        enable_voxel_pruning: bool, whether to enable voxel pruning (unused)
+        voxel_size: float, voxel size in metric scale (unused)
+
+    Returns:
+        dict: Loss dictionary
+        dict: Image dictionary for visualization
+    """
+    gt_rgb = vggt_batch["images"]  # [B, S, 3, H, W]
+    gt_depths = vggt_batch["depths"]  # [B, S, H, W]
+    point_masks = vggt_batch.get("point_masks")  # [B, S, H, W]
+
+    # Get Gaussians from adapter output (already processed)
+    gaussians = preds["gaussians"]
+    # gaussians.means: [B, S*H*W, 3]
+    # gaussians.scales: [B, S*H*W, 3]
+    # gaussians.rotations: [B, S*H*W, 4] (wxyz)
+    # gaussians.harmonics: [B, S*H*W, 3, d_sh]
+    # gaussians.opacities: [B, S*H*W] (already sigmoid activated)
+
+    B, S, _, image_height, image_width = gt_rgb.shape
+
+    extrinsics = preds["extrinsics"]  # [B, S, 4, 4]
+    intrinsics = preds["intrinsics"]  # [B, S, 3, 3]
+
+    if sampled_frame_indices is None:
+        sampled_frame_indices = list(range(S))
+    num_frames_to_render = len(sampled_frame_indices)
+
+    # Prepare gaussian parameters for rasterization
+    # rasterization expects shared gaussians across all cameras, so extract from batch dim
+    means = gaussians.means[0]  # [S*H*W, 3]
+    scales = gaussians.scales[0]  # [S*H*W, 3]
+    rotations = gaussians.rotations[0]  # [S*H*W, 4]
+    opacities = gaussians.opacities[0]  # [S*H*W]
+    harmonics = gaussians.harmonics[0]  # [S*H*W, 3, d_sh]
+
+    # rasterization expects colors as [..., N, K, 3], but harmonics is [N, 3, d_sh]
+    # transpose to get [N, d_sh, 3]
+    colors = harmonics.transpose(-1, -2)  # [S*H*W, d_sh, 3]
+
+    # Get viewmat and intrinsics for all frames
+    viewmats = extrinsics[0]  # [S, 4, 4]
+    Ks = intrinsics[0]  # [S, 3, 3]
+
+    # Render all sampled views at once
+    render_colors, render_alphas, _ = rasterization(
+        means=means,
+        quats=rotations,
+        scales=scales,
+        opacities=opacities,
+        colors=colors,
+        viewmats=viewmats,
+        Ks=Ks,
+        width=image_width,
+        height=image_height,
+        near_plane=0.0001,
+        far_plane=1000.0,
+        radius_clip=0,
+        eps2d=0.3,
+        sh_degree=sh_degree,
+        render_mode="RGB+ED",
+    )
+    # render_colors: [S, H, W, 4] (RGB + depth)
+    # render_alphas: [S, H, W, 1]
+
+    # Extract rendered images for sampled frames
+    render_colors_sampled = render_colors[sampled_frame_indices]  # [num_sampled, H, W, 4]
+
+    gt_colors_sampled = gt_rgb[0, sampled_frame_indices]  # [num_sampled, 3, H, W]
+    gt_depths_sampled = gt_depths[0, sampled_frame_indices]  # [num_sampled, H, W]
+
+    # Extract RGB and depth from renders
+    pred_rgb = render_colors_sampled[..., :3].permute(0, 3, 1, 2)  # [num_sampled, 3, H, W]
+    pred_rgb = torch.clamp(pred_rgb, min=0, max=1)
+    pred_depth = render_colors_sampled[..., -1]  # [num_sampled, H, W]
+
+    # Compute losses
+    valid_depth_mask = point_masks[0, sampled_frame_indices].bool()
+    depth_loss = F.l1_loss(pred_depth[valid_depth_mask], gt_depths_sampled[valid_depth_mask])
+    depth_loss = check_and_fix_inf_nan(depth_loss, "self_depth_loss")
+
+    rgb_loss = F.l1_loss(pred_rgb, gt_colors_sampled)
+    rgb_loss = check_and_fix_inf_nan(rgb_loss, "self_rgb_mse")
+
+    lpips_loss = compute_lpips(pred_rgb, gt_colors_sampled).mean()
+    lpips_loss = check_and_fix_inf_nan(lpips_loss, "self_lpips_loss")
+
+    self_loss_dict = {
+        "loss_self_render_rgb": rgb_loss,
+        "loss_self_render_lpips": lpips_loss,
+        "loss_self_render_depth": depth_loss,
+    }
+
+    img_dict = {
+        "self_rgb_pred": pred_rgb,
+        "self_rgb_gt": gt_colors_sampled,
+        "self_depth_pred": pred_depth.unsqueeze(1),
+        "self_depth_gt": gt_depths_sampled.unsqueeze(1),
+    }
+
+    return self_loss_dict, img_dict

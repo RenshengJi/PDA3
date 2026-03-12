@@ -1,0 +1,94 @@
+# Training configuration for Gaussian Head finetuning only
+# All other parameters are frozen, only gaussian head is trained
+
+# Sparse depth (LiDAR) input configuration
+sparse_depth:
+  enabled: false
+  input_prob: 0.0
+  keep_ratio_range: [0.0, 0.0]
+
+# Model configuration
+model:
+  encoder_name: "vitg"
+  out_layers: [19, 27, 33, 39]
+  features: 256
+  out_channels: [256, 512, 1024, 1024]
+  alt_start: 13
+  qknorm_start: 13
+  rope_start: 13
+  predict_camera: true
+  use_camera_enc: true
+  # Enable Gaussian head
+  predict_gaussians: true
+  gaussian_sh_degree: 2
+  gaussian_output_dim: 38
+  # Path to pretrained DA3 weights (with all parameters except gaussian head)
+  pretrained: "checkpoints/model.safetensors"
+
+# Teacher model configuration
+teacher:
+  enabled: false
+
+# Data configuration
+data:
+  train_root: "./data"
+  val_root: "/data2/ziqi.shi/waymo-flow-seg-val"
+  camera_ids: ["1"]
+  intervals: [3]
+  num_views: 8
+  resolution: 336
+  batch_size: 1
+  num_workers: 4
+
+# Training configuration
+training:
+  num_epochs: 500
+  save_interval: 50
+  val_interval: 500
+  use_camera_input: true
+  camera_dropout_prob: 0.8
+  # Freeze all parameters except gaussian head
+  freeze_backbone: true
+  freeze_depth_head: true
+  freeze_camera_head: true
+  freeze_depth_encoder: true
+  freeze_camera_encoder: true
+
+# Optimizer configuration - ONLY for gaussian head
+optimizer:
+  # Gaussian head learning rate (higher since we're only training this)
+  gaussian_head_lr: 1.0e-3
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+# Learning rate scheduler
+scheduler:
+  type: "cosine"
+  T_max: 500
+  eta_min: 1.0e-6
+
+# Loss configuration - ONLY gaussian rendering loss
+loss:
+  # Disable all other losses
+  use_depth: false
+  use_gradient: false
+  use_ray: false
+  use_point: false
+  use_camera: false
+  use_teacher: false
+
+  # Enable only self-rendering loss for gaussian head
+  use_self_render: true
+  self_render_weight: 1.0
+  self_render_rgb_weight: 1.0
+  self_render_lpips_weight: 0.1
+  self_render_depth_weight: 0.5
+
+  # Gaussian head specific parameters
+  gaussian_sh_degree: 0
+  enable_voxel_pruning: false
+  voxel_size: 0.002
+
+# Logging
+log_interval: 10
+output_dir: "output/gaussian_head_only"
