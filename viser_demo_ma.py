@@ -64,9 +64,18 @@ def load_config(config_path):
     return config
 
 
-def depth_to_points_with_conf(depth, conf, intrinsics, conf_threshold_percentile, max_depth, max_points=100000):
+def depth_to_points_with_conf(depth, conf, intrinsics, conf_threshold_percentile, max_depth, max_height=30, max_points=100000):
     """
     Convert depth map to 3D points with confidence filtering.
+
+    Args:
+        depth: (H, W) depth map
+        conf: (H, W) confidence map
+        intrinsics: (3, 3) camera intrinsics
+        conf_threshold_percentile: confidence percentile threshold (0-100)
+        max_depth: maximum depth value
+        max_height: maximum height value (y coordinate)
+        max_points: maximum number of points to return
     """
     H, W = depth.shape
 
@@ -92,7 +101,7 @@ def depth_to_points_with_conf(depth, conf, intrinsics, conf_threshold_percentile
     else:
         threshold_val = 0
 
-    valid_mask = (depth > 0) & (depth < max_depth) & (conf >= threshold_val) & (conf > 1e-5)
+    valid_mask = (depth > 0) & (depth < max_depth) & (y > -max_height) & (conf >= threshold_val) & (conf > 1e-5)
 
     points = points[valid_mask]
     pixel_coords = np.stack([v[valid_mask], u[valid_mask]], axis=-1)
@@ -426,6 +435,13 @@ def main():
             step=5,
             initial_value=80,
         )
+        max_height_slider = server.gui.add_slider(
+            "Max Height",
+            min=1,
+            max=100,
+            step=1,
+            initial_value=30,
+        )
         conf_threshold_slider = server.gui.add_slider(
             "Confidence Percent",
             min=0,
@@ -593,6 +609,7 @@ def main():
 
         S = pred_depth.shape[0]
         max_depth = max_depth_slider.value
+        max_height = max_height_slider.value
         conf_threshold = conf_threshold_slider.value
 
         # Determine which frames to show
@@ -640,6 +657,7 @@ def main():
                 intrinsics_scaled,
                 conf_threshold,
                 max_depth,
+                max_height,
                 max_points=args.max_points
             )
 
@@ -713,6 +731,7 @@ def main():
                         intrinsics_scaled,
                         conf_threshold_percentile=0,  # Show all sparse points
                         max_depth=max_depth,
+                        max_height=max_height,
                         max_points=args.max_points
                     )
 
@@ -744,6 +763,7 @@ def main():
                         intrinsics_scaled,
                         conf_threshold_percentile=0,  # Show all GT points
                         max_depth=max_depth,
+                        max_height=max_height,
                         max_points=args.max_points
                     )
 
@@ -800,6 +820,10 @@ def main():
         update_visualization()
 
     @max_depth_slider.on_update
+    def _(_):
+        update_visualization()
+
+    @max_height_slider.on_update
     def _(_):
         update_visualization()
 

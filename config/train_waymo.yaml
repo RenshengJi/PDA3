@@ -50,13 +50,13 @@ teacher:
 data:
   # Path to Waymo dataset
   train_root: "./data"
-  val_root: "./data"
+  val_root: "/data2/ziqi.shi/waymo-flow-seg-val"
   # Camera IDs to use (1=FRONT, 2=FRONT_LEFT, 3=FRONT_RIGHT)
-  camera_ids: ["1", "2", "3"]
+  camera_ids: ["1"]
   # Frame sampling intervals
-  intervals: [1, 2, 3]
+  intervals: [3]
   # Number of context frames
-  num_views: 4
+  num_views: 8
   # Image resolution (must be divisible by 14 for ViT patch size)
   # Paper uses 504x504 as base resolution
   resolution: 336
@@ -143,4 +143,4 @@ loss:
 
 # Logging
 log_interval: 10
-output_dir: "outputs"
+output_dir: "output"
