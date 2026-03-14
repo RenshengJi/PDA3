@@ -36,7 +36,7 @@ data:
   camera_ids: ["1"]
   intervals: [3]
   num_views: 8
-  resolution: 336
+  resolution: 560
   batch_size: 1
   num_workers: 4
 
@@ -82,7 +82,7 @@ loss:
   self_render_weight: 1.0
   self_render_rgb_weight: 1.0
   self_render_lpips_weight: 0.1
-  self_render_depth_weight: 0.5
+  self_render_depth_weight: 0.0
 
   # Gaussian head specific parameters (note: gaussian_sh_degree now comes from model config)
   enable_voxel_pruning: false
