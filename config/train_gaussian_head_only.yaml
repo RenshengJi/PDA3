@@ -45,8 +45,8 @@ training:
   num_epochs: 500
   save_interval: 50
   val_interval: 500
-  use_camera_input: true
-  camera_dropout_prob: 0.8
+  use_camera_input: false
+  camera_dropout_prob: 0.0
   # Freeze all parameters except gaussian head
   freeze_backbone: true
   freeze_depth_head: true
@@ -57,7 +57,7 @@ training:
 # Optimizer configuration - ONLY for gaussian head
 optimizer:
   # Gaussian head learning rate (higher since we're only training this)
-  gaussian_head_lr: 1.0e-3
+  gaussian_head_lr: 1.0e-5
   weight_decay: 0.01
   max_grad_norm: 1.0
 
@@ -84,8 +84,7 @@ loss:
   self_render_lpips_weight: 0.1
   self_render_depth_weight: 0.5
 
-  # Gaussian head specific parameters
-  gaussian_sh_degree: 0
+  # Gaussian head specific parameters (note: gaussian_sh_degree now comes from model config)
   enable_voxel_pruning: false
   voxel_size: 0.002
 

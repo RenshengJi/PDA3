@@ -1106,7 +1106,7 @@ class DA3Loss(nn.Module):
 
         loss_dict['total_loss'] = total_loss
 
-
+        return loss_dict
 
 
 def self_render_and_loss(
@@ -1162,42 +1162,61 @@ def self_render_and_loss(
         sampled_frame_indices = list(range(S))
     num_frames_to_render = len(sampled_frame_indices)
 
-    # Prepare gaussian parameters for rasterization
-    # rasterization expects shared gaussians across all cameras, so extract from batch dim
-    means = gaussians.means[0]  # [S*H*W, 3]
-    scales = gaussians.scales[0]  # [S*H*W, 3]
-    rotations = gaussians.rotations[0]  # [S*H*W, 4]
-    opacities = gaussians.opacities[0]  # [S*H*W]
-    harmonics = gaussians.harmonics[0]  # [S*H*W, 3, d_sh]
+    # Extract Gaussian parameters from batch dim
+    means_all = gaussians.means[0]  # [S*H*W, 3]
+    scales_all = gaussians.scales[0]  # [S*H*W, 3]
+    rotations_all = gaussians.rotations[0]  # [S*H*W, 4]
+    opacities_all = gaussians.opacities[0]  # [S*H*W]
+    harmonics_all = gaussians.harmonics[0]  # [S*H*W, 3, d_sh]
 
     # rasterization expects colors as [..., N, K, 3], but harmonics is [N, 3, d_sh]
     # transpose to get [N, d_sh, 3]
-    colors = harmonics.transpose(-1, -2)  # [S*H*W, d_sh, 3]
+    colors_all = harmonics_all.transpose(-1, -2)  # [S*H*W, d_sh, 3]
 
     # Get viewmat and intrinsics for all frames
     viewmats = extrinsics[0]  # [S, 4, 4]
     Ks = intrinsics[0]  # [S, 3, 3]
 
-    # Render all sampled views at once
-    render_colors, render_alphas, _ = rasterization(
-        means=means,
-        quats=rotations,
-        scales=scales,
-        opacities=opacities,
-        colors=colors,
-        viewmats=viewmats,
-        Ks=Ks,
-        width=image_width,
-        height=image_height,
-        near_plane=0.0001,
-        far_plane=1000.0,
-        radius_clip=0,
-        eps2d=0.3,
-        sh_degree=sh_degree,
-        render_mode="RGB+ED",
-    )
-    # render_colors: [S, H, W, 4] (RGB + depth)
-    # render_alphas: [S, H, W, 1]
+    # Render each frame independently with only its own Gaussians
+    render_colors_list = []
+    for frame_idx in range(S):
+        # Extract Gaussians for this frame
+        # Gaussians are stored as [S*H*W, ...], so frame s occupies indices [s*H*W : (s+1)*H*W]
+        start_idx = frame_idx * image_height * image_width
+        end_idx = (frame_idx + 1) * image_height * image_width
+
+        means = means_all[start_idx:end_idx]  # [H*W, 3]
+        scales = scales_all[start_idx:end_idx]  # [H*W, 3]
+        rotations = rotations_all[start_idx:end_idx]  # [H*W, 4]
+        opacities = opacities_all[start_idx:end_idx]  # [H*W]
+        colors = colors_all[start_idx:end_idx]  # [H*W, d_sh, 3]
+
+        # Render this frame's Gaussians only on this frame's camera
+        frame_viewmat = viewmats[frame_idx:frame_idx+1]  # [1, 4, 4]
+        frame_K = Ks[frame_idx:frame_idx+1]  # [1, 3, 3]
+
+        render_color, render_alpha, _ = rasterization(
+            means=means,
+            quats=rotations,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            viewmats=frame_viewmat,
+            Ks=frame_K,
+            width=image_width,
+            height=image_height,
+            near_plane=0.0001,
+            far_plane=1000.0,
+            radius_clip=0,
+            eps2d=0.3,
+            sh_degree=sh_degree,
+            render_mode="RGB+ED",
+        )
+        # render_color: [1, H, W, 4] (RGB + depth)
+        render_colors_list.append(render_color[0])
+
+    # Stack all rendered frames: [S, H, W, 4]
+    render_colors = torch.stack(render_colors_list, dim=0)
 
     # Extract rendered images for sampled frames
     render_colors_sampled = render_colors[sampled_frame_indices]  # [num_sampled, H, W, 4]

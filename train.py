@@ -270,6 +270,7 @@ class Trainer:
     def setup_loss(self):
         """Setup loss function based on DA3 paper."""
         loss_config = self.config.get('loss', {})
+        model_config = self.config.get('model', {})
 
         self.criterion = DA3Loss(
             # Depth loss (confidence-weighted L1 with log regularization)
@@ -310,7 +311,7 @@ class Trainer:
             self_render_rgb_weight=loss_config.get('self_render_rgb_weight', 1.0),
             self_render_lpips_weight=loss_config.get('self_render_lpips_weight', 0.1),
             self_render_depth_weight=loss_config.get('self_render_depth_weight', 0.5),
-            gaussian_sh_degree=loss_config.get('gaussian_sh_degree', 0),
+            gaussian_sh_degree=model_config.get('gaussian_sh_degree', 0),
             enable_voxel_pruning=loss_config.get('enable_voxel_pruning', False),
             voxel_size=loss_config.get('voxel_size', 0.002),
         )
@@ -345,31 +346,26 @@ class Trainer:
             for name, param in model.named_parameters():
                 if 'backbone' in name:
                     param.requires_grad = False
-                    print(f"Freezing: {name}")
 
         if freeze_depth_head:
             for name, param in model.named_parameters():
                 if 'head' in name and 'gs_head' not in name:
                     param.requires_grad = False
-                    print(f"Freezing: {name}")
 
         if freeze_camera_head:
             for name, param in model.named_parameters():
                 if 'cam_dec' in name:
                     param.requires_grad = False
-                    print(f"Freezing: {name}")
 
         if freeze_depth_encoder:
             for name, param in model.named_parameters():
                 if 'depth_enc' in name:
                     param.requires_grad = False
-                    print(f"Freezing: {name}")
 
         if freeze_camera_encoder:
             for name, param in model.named_parameters():
                 if 'cam_enc' in name:
                     param.requires_grad = False
-                    print(f"Freezing: {name}")
 
         # Separate parameters by type
         encoder_params = []

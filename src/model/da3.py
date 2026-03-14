@@ -383,8 +383,8 @@ class DepthAnything3Net(nn.Module):
         H: int,
         W: int,
         output: AdDict,
-        extrinsics: Optional[torch.Tensor] = None,
-        intrinsics: Optional[torch.Tensor] = None,
+        gt_extrinsics: Optional[torch.Tensor] = None,
+        gt_intrinsics: Optional[torch.Tensor] = None,
     ) -> AdDict:
         """Process features through Gaussian head for 3D Gaussian Splatting.
 
@@ -413,19 +413,10 @@ class DepthAnything3Net(nn.Module):
 
         # Get opacity from gs_head conf output (already sigmoid activated)
         opacities_raw = gs_params_raw["raw_gs_conf"]  # [B*S, H, W]
-        opacities = opacities_raw.reshape(B, S, H, W)  # [B, S, H, W]
+        opacities = opacities_raw.reshape(B, S, H, W)  # [B, S, H, W] 
 
-        # Reshape gaussian parameters for adapter
-        gaussian_params_reshaped = gs_params_raw["raw_gs"].reshape(
-            B, S, -1, H, W
-        )  # [B, S, param_dim, H, W]
-        gaussian_params_reshaped = gaussian_params_reshaped.permute(0, 1, 3, 4, 2)  # [B, S, H, W, param_dim]
-
-        # Use provided extrinsics/intrinsics, or fall back to output predictions
-        if extrinsics is None:
-            extrinsics = output.get("extrinsics", None)
-        if intrinsics is None:
-            intrinsics = output.get("intrinsics", None)
+        extrinsics = output.get("extrinsics", None)
+        intrinsics = output.get("intrinsics", None)
 
         # Process through Gaussian adapter
         if extrinsics is not None and intrinsics is not None:
@@ -434,9 +425,9 @@ class DepthAnything3Net(nn.Module):
                 intrinsics=intrinsics,
                 depths=depths,
                 opacities=opacities,  # [B, S, H, W]
-                raw_gaussians=gaussian_params_reshaped,  # [B, S, H, W, param_dim]
+                raw_gaussians=gs_params_raw["raw_gs"],  # [B, S, H, W, param_dim]
                 image_shape=(H, W),
-                gt_extrinsics=extrinsics,  # Use for alignment if needed
+                gt_extrinsics=gt_extrinsics,  # Use for alignment if needed
             )
 
             # Store Gaussian outputs
