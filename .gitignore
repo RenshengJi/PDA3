@@ -30,6 +30,6 @@ __pycache__/
 *.npy
 
 config/other/
-output/
-data/
-checkpoints/
+output
+data
+checkpoints
